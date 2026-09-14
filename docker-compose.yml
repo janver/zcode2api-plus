@@ -13,9 +13,5 @@ services:
       ZCODE_GATEWAY_KEY: "${ZCODE_GATEWAY_KEY:?请在 .env 中设置 ZCODE_GATEWAY_KEY}"
       ZCODE_CAPTCHA_BROWSER: "${ZCODE_CAPTCHA_BROWSER:-true}"
     volumes:
-      - zcode-data:/data
-      - zcode-browser:/home/appuser/.cloakbrowser
-
-volumes:
-  zcode-data:
-  zcode-browser:
+      - ./zcode-data:/data
+      - ./zcode-browser:/home/appuser/.cloakbrowser
