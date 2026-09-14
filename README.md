@@ -89,6 +89,16 @@ docker compose down
 首次触发验证码时才会下载浏览器，服务器需要能够访问 `cloakbrowser.dev`；
 `ZCODE_CAPTCHA_BROWSER=true` 时启用自动浏览器求解，失败后回退人工回填。
 
+> ⚠️ 数据卷的两种挂法：
+> - **named volume**（默认配置）：无需额外操作。
+> - **bind mount**（如 `./zcode-data:/data`）：容器以非 root 用户 `appuser`
+>   （uid 10001）运行，宿主机目录必须先授权，否则启动会报
+>   `存储初始化失败: unable to open database file (14)`：
+>
+>   ```bash
+>   sudo chown -R 10001:10001 ./zcode-data ./zcode-browser
+>   ```
+
 ## 部署（Docker，推薦）
 
 ```bash
