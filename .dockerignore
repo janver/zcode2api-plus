@@ -1,0 +1,8 @@
+# 构建上下文排除项。注意：frontend/dist 必须保留，
+# 二进制通过 go:embed 把它编入（见仓库根 webui.go）。
+.git/
+.tmp/
+data/
+data_test/
+.env
+**/node_modules/

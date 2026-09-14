@@ -1,0 +1,21 @@
+services:
+  zcode2api:
+    image: ghcr.io/janver/zcode2api-plus:latest
+    container_name: zcode2api
+    restart: unless-stopped
+    ports:
+      - "${ZCODE_PORT:-3000}:3000"
+    environment:
+      ZCODE_HOST: 0.0.0.0
+      ZCODE_PORT: 3000
+      ZCODE_DATA_DIR: /data
+      ZCODE_ADMIN_KEY: "${ZCODE_ADMIN_KEY:?请在 .env 中设置 ZCODE_ADMIN_KEY}"
+      ZCODE_GATEWAY_KEY: "${ZCODE_GATEWAY_KEY:?请在 .env 中设置 ZCODE_GATEWAY_KEY}"
+      ZCODE_CAPTCHA_BROWSER: "${ZCODE_CAPTCHA_BROWSER:-true}"
+    volumes:
+      - zcode-data:/data
+      - zcode-browser:/home/appuser/.cloakbrowser
+
+volumes:
+  zcode-data:
+  zcode-browser:

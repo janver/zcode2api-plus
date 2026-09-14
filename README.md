@@ -53,6 +53,57 @@ zcode2api set-admin-key <key>        設置後台密碼
 zcode2api export [file] / import <file>   賬號導出/導入（與 python-legacy 互通）
 ```
 
+## 部署（Docker Compose，推薦）
+
+在项目根目录创建 `.env`：
+
+```dotenv
+ZCODE_ADMIN_KEY=改成你的後台密碼
+ZCODE_GATEWAY_KEY=改成你的網關金鑰
+# 可选：修改宿主机端口，默认 3000
+# ZCODE_PORT=3000
+# 可选：关闭浏览器验证码模式
+# ZCODE_CAPTCHA_BROWSER=true
+```
+
+启动、查看日志和升级：
+
+```bash
+# 根据服务器架构自动使用 linux/amd64 或 linux/arm64 镜像
+docker compose pull
+docker compose up -d
+
+docker compose logs -f zcode2api
+
+docker compose ps
+
+# 发布新镜像后升级
+docker compose pull && docker compose up -d
+
+# 停止并删除容器（不会删除账号和 Chromium 缓存卷）
+docker compose down
+```
+
+配置文件见 [`docker-compose.yml`](docker-compose.yml)。默认使用 GHCR 发布镜像，
+`zcode-data` 持久化账号数据库与设备指纹，`zcode-browser` 持久化自动下载的 Chromium。
+首次触发验证码时才会下载浏览器，服务器需要能够访问 `cloakbrowser.dev`；
+`ZCODE_CAPTCHA_BROWSER=true` 时启用自动浏览器求解，失败后回退人工回填。
+
+## 部署（Docker，推薦）
+
+```bash
+# 推 v* tag 後 CI 自動構建 linux/amd64 + linux/arm64 雙架構鏡像並推送到 GHCR
+docker run -d --name zcode2api -p 3000:3000 \
+  -v zcode-data:/data \
+  -e ZCODE_ADMIN_KEY=改成你的後台密碼 \
+  -e ZCODE_GATEWAY_KEY=改成你的網關金鑰 \
+  ghcr.io/janver/zcode2api-plus:latest
+```
+
+鏡像內為單靜態二進制（前端已內嵌），數據持久化在 `/data` 卷；
+驗證碼瀏覽器模式加 `-e ZCODE_CAPTCHA_BROWSER=true`，補丁 Chromium
+首次啟動自動下載（緩存於容器內 `~/.cloakbrowser`，可另掛卷持久化）。
+
 ## 部署（裸二進制 + systemd，推薦）
 
 ```ini
