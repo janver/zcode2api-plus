@@ -8,6 +8,7 @@ import (
 	"context"
 	cryptoRand "crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -195,8 +196,12 @@ func (e *Engine) tryAccount(
 
 		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, req.URL, bytes.NewReader(payload))
 		if err != nil {
-			e.mark(acc, model.StatusInvalid, err.Error())
-			return attemptResult{switchAccount: true}
+			// 失败源于 req.URL（即 ZAI_UPSTREAM_URL 配置），与账号凭证无关。
+			// 标 invalid 会把整池账号逐个标失效并落库，且 last_error 指向错误方向。
+			// 配置错误换号也修不好，直接终止并如实报告。
+			web.Err(reqID, fmt.Sprintf("上游地址无效（检查 ZAI_UPSTREAM_URL）: %v", err))
+			return attemptResult{final: errResult(http.StatusBadGateway, "invalid_upstream_url",
+				"上游地址配置无效，请检查 ZAI_UPSTREAM_URL")}
 		}
 		for k, v := range req.Headers {
 			httpReq.Header.Set(k, v)
@@ -204,6 +209,15 @@ func (e *Engine) tryAccount(
 
 		resp, err := e.clientFor(acc).Do(httpReq)
 		if err != nil {
+			// 客户端主动断开（Ctrl-C、调用方超时、反代截断）会让 ctx 取消，
+			// Do 随即返回 context.Canceled。这不是账号的问题：若照「连接失败」
+			// 处理，后续每轮 Select→Do 都会立刻失败，最多把 5 个账号各标一次
+			// 冷却并落库，小账号池几次中断就全池不可用。此时直接终止，
+			// 不写任何账号状态。
+			if isCanceled(ctx, err) {
+				web.Warn(reqID, "客户端已断开，终止重试")
+				return canceledResult()
+			}
 			e.mark(acc, model.StatusCooling, "连接失败: "+err.Error())
 			web.Warn(reqID, fmt.Sprintf("账号 %s 连接失败，切换下一个", acc.Name))
 			return attemptResult{switchAccount: true}
@@ -262,7 +276,11 @@ func (e *Engine) handleUpstreamError(
 	body, err := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
 	if err != nil {
-		// 读不出错误体：按连接失败处理
+		// 读不出错误体：客户端断开同样会让读失败，此时不能归咎于账号
+		if isCanceled(ctx, err) {
+			web.Warn(reqID, "客户端已断开，终止重试")
+			return canceledResult()
+		}
 		e.mark(acc, model.StatusCooling, "连接失败: "+err.Error())
 		return attemptResult{switchAccount: true}
 	}
@@ -304,7 +322,7 @@ func (e *Engine) handleUpstreamError(
 			web.Warn(reqID, fmt.Sprintf("模型并发准入受限，%g s 后重试（账号仍可用）", delay.Seconds()))
 			select {
 			case <-ctx.Done():
-				return attemptResult{final: errResult(http.StatusServiceUnavailable, "canceled", "请求已取消")}
+				return canceledResult()
 			case <-time.After(delay):
 			}
 			return attemptResult{retryCaptcha: true}
@@ -323,7 +341,7 @@ func (e *Engine) handleUpstreamError(
 			web.Warn(reqID, fmt.Sprintf("账号 %s 的 %s 觸發用量上限，切換下一個", acc.Name, orCurrent(modelName)))
 			e.fireRefresh(acc)
 		} else {
-			e.mark(acc, model.StatusCooling, "上游限流 429")
+			e.mark(acc, model.StatusCooling, "上游限流 HTTP 429")
 			web.Warn(reqID, fmt.Sprintf("账号 %s 被限流 429，切换下一个", acc.Name))
 		}
 		return attemptResult{switchAccount: true}
@@ -383,7 +401,7 @@ func (e *Engine) handleUpstreamJSON(
 		return attemptResult{final: runResult{
 			Status: http.StatusBadGateway,
 			Body: map[string]any{"error": map[string]any{
-				"message": messageFromJSON(text, buffered),
+				"message": MessageFromJSON(text, buffered),
 				"type":    "upstream_error",
 				"code":    code,
 			}},
@@ -431,69 +449,125 @@ func (e *Engine) finishDelivery(reqID string, acc *model.Account, usage *UsageCo
 	}
 	usage.Finish()
 	got := usage.AsDict()
-	acc.AccumulateTokens(got)
-	_ = e.Store.UpdateAccount(acc)
+	e.Store.Update(acc.Provider, acc.ID, func(a *model.Account) {
+		a.AccumulateTokens(got)
+	})
 	web.ReqOk(reqID, got.Output)
 	return attemptResult{final: runResult{Delivered: true}}
 }
 
 // ── 账号状态标记（对齐 Python 版 _mark / _mark_model_exhausted）──────────────
+//
+// MarkAccount / MarkModelExhausted 同时导出，供 asyncpool 复用同一套状态机；
+// 两条请求路径对同一账号必须标出相同状态（曾因 asyncpool 自行实现而分歧）。
+//
+// 二者按账号 ID 定位并在 Store 锁内修改真实对象：调用方持有的是 Select
+// 返回的深拷贝，直接改它既不会落库、也会与并发读取竞争。
 
-func (e *Engine) mark(acc *model.Account, status, errMsg string) {
-	acc.Status = status
-	acc.LastError = &errMsg
-	if status == model.StatusCooling {
-		until := float64(e.now().Add(time.Duration(config.CoolingSeconds) * time.Second).UnixNano()) / 1e9
-		acc.CoolingUntil = &until
-	}
-	_ = e.Store.UpdateAccount(acc)
+// MarkAccount 设置账号状态；status 为 cooling 时按配置写入冷却截止时间。
+// 账号不存在时静默返回（可能已被后台删除）。
+func MarkAccount(st *store.Store, provider, id, status, errMsg string, now time.Time) {
+	st.Update(provider, id, func(acc *model.Account) {
+		acc.Status = status
+		acc.LastError = &errMsg
+		if status == model.StatusCooling {
+			until := float64(now.Add(time.Duration(config.CoolingSeconds)*time.Second).UnixNano()) / 1e9
+			acc.CoolingUntil = &until
+		}
+	})
 }
 
-// markModelExhausted 只停用已耗尽的请求模型；所有已知模型皆耗尽时才停用整号。
+// MarkModelExhausted 只停用已耗尽的请求模型；所有已知模型皆耗尽时才停用整号。
+//
+// 只负责「额度」这一类信号，因此不覆盖更强的状态：invalid（凭据已失效）、
+// cooling（刚被上游限流）、disabled（人工停用）都保持原状。额度信号没有
+// 资格断言账号已恢复——否则并发请求里 A 刚标出的 invalid 会被 B 的额度
+// 信号刷成 active，失效账号重新进入轮询，每次选中都是一次白费的上游调用。
+func MarkModelExhausted(st *store.Store, provider, id string, modelName any, errMsg string) {
+	st.Update(provider, id, func(acc *model.Account) {
+		if !acc.MarkModelExhausted(modelName) {
+			// 模型名无法归一化：无法做模型级停用，退回整号停用
+			if isStrongStatus(acc.Status) {
+				return
+			}
+			acc.Status = model.StatusExhausted
+			acc.LastError = &errMsg
+			return
+		}
+		if isStrongStatus(acc.Status) {
+			// 模型级标记已写入 ExhaustedModels，这里不动状态与 last_error：
+			// 把「刚被 429 限流」改写成「额度用完」会掩盖真实原因。
+			return
+		}
+		anyState := false
+		allExhausted := true
+		for name, quota := range acc.Quota {
+			entryModel, _ := quota["model"].(string)
+			if entryModel == "" {
+				entryModel = name
+			}
+			anyState = true
+			if acc.ModelAvailability(entryModel) != "exhausted" {
+				allExhausted = false
+				break
+			}
+		}
+		if anyState && allExhausted {
+			acc.Status = model.StatusExhausted
+		} else {
+			acc.Status = model.StatusActive
+		}
+		acc.CoolingUntil = nil
+		acc.LastError = &errMsg
+	})
+}
+
+// isStrongStatus 判断账号是否处于「比额度耗尽更强」的状态：
+// 这些状态由凭据校验或上游限流直接判定，额度信号不得覆盖。
+func isStrongStatus(status string) bool {
+	switch status {
+	case model.StatusInvalid, model.StatusCooling, model.StatusDisabled:
+		return true
+	}
+	return false
+}
+
+func (e *Engine) mark(acc *model.Account, status, errMsg string) {
+	MarkAccount(e.Store, acc.Provider, acc.ID, status, errMsg, e.now())
+}
+
 func (e *Engine) markModelExhausted(acc *model.Account, modelName any, errMsg string) {
-	if !acc.MarkModelExhausted(modelName) {
-		e.mark(acc, model.StatusExhausted, errMsg)
-		return
-	}
-	anyState := false
-	allExhausted := true
-	for name, quota := range acc.Quota {
-		entryModel, _ := quota["model"].(string)
-		if entryModel == "" {
-			entryModel = name
+	MarkModelExhausted(e.Store, acc.Provider, acc.ID, modelName, errMsg)
+}
+
+// MarkSuccess 记录一次成功调用：累计调用次数与最后使用时间，并把
+// cooling/exhausted 复位为 active（有成功响应即证明账号当前可用）。
+//
+// 导出供 async 池复用：两条请求路径对同一账号必须记出相同的统计与状态，
+// 否则后台用量页会漏算 async 流量，冷却到期的账号也只能等下一轮额度轮询
+// 才恢复调度。
+func MarkSuccess(st *store.Store, provider, id string, now time.Time) {
+	ts := float64(now.UnixNano()) / 1e9
+	st.Update(provider, id, func(a *model.Account) {
+		a.UseCount++
+		a.LastUsedAt = &ts
+		if a.Status == model.StatusCooling || a.Status == model.StatusExhausted {
+			a.Status = model.StatusActive
 		}
-		anyState = true
-		if acc.ModelAvailability(entryModel) != "exhausted" {
-			allExhausted = false
-			break
-		}
-	}
-	if anyState && allExhausted {
-		acc.Status = model.StatusExhausted
-	} else {
-		acc.Status = model.StatusActive
-	}
-	acc.CoolingUntil = nil
-	acc.LastError = &errMsg
-	_ = e.Store.UpdateAccount(acc)
+	})
 }
 
 // success 记录成功调用的账号状态；并异步触发一次额度刷新
-//（对齐 Python 200 成功路径的 create_task(_safe_refresh)）。
+// （对齐 Python 200 成功路径的 create_task(_safe_refresh)）。
 func (e *Engine) success(acc *model.Account) {
-	acc.UseCount++
-	ts := float64(e.now().UnixNano()) / 1e9
-	acc.LastUsedAt = &ts
-	if acc.Status == model.StatusCooling || acc.Status == model.StatusExhausted {
-		acc.Status = model.StatusActive
-	}
-	_ = e.Store.UpdateAccount(acc)
+	MarkSuccess(e.Store, acc.Provider, acc.ID, e.now())
 	e.fireRefresh(acc)
 }
 
 func (e *Engine) bumpFail(acc *model.Account) {
-	acc.FailCount++
-	_ = e.Store.UpdateAccount(acc)
+	e.Store.Update(acc.Provider, acc.ID, func(a *model.Account) {
+		a.FailCount++
+	})
 }
 
 // fireRefresh 触发额度刷新（M3 接入 quota 包；仅 JWT 账号，对齐 _safe_refresh）。
@@ -559,6 +633,26 @@ func errResult(status int, errType, msg string) runResult {
 	}
 }
 
+// canceledResult 客户端主动断开时的统一响应。
+//
+// 此时响应通常已写不出去（连接已断），返回它只是为了终止重试循环、
+// 让调用方走正常收尾路径；关键是**不写任何账号状态**——中断与账号健康无关。
+func canceledResult() attemptResult {
+	return attemptResult{final: errResult(http.StatusServiceUnavailable, "canceled", "请求已取消")}
+}
+
+// isCanceled 判断上游调用失败是否源于 ctx 取消/超时（而非账号或网络问题）。
+//
+// http.Client.Do 会把底层错误包进 *url.Error，context.Canceled 在 errors.Is
+// 下仍可穿透，因此同时检查 ctx 自身状态作为兜底（例如 cancel 与 Do 竞态时
+// 返回的是连接层错误）。
+func isCanceled(ctx context.Context, err error) bool {
+	if ctx.Err() != nil {
+		return true
+	}
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
 // passthroughBodyWithType 解析上游错误体透传；解析失败时构造兜底错误结构。
 func passthroughBodyWithType(text, fallbackType string) any {
 	var payload map[string]any
@@ -571,8 +665,9 @@ func passthroughBodyWithType(text, fallbackType string) any {
 	}}
 }
 
-// messageFromJSON 取业务错误的 msg/message 字段，回退到正文预览。
-func messageFromJSON(text string, raw []byte) string {
+// MessageFromJSON 取业务错误的 msg/message 字段，回退到正文预览。
+// 导出供 async 池复用：两条路径对同一上游响应必须给出相同的错误文案。
+func MessageFromJSON(text string, raw []byte) string {
 	var payload map[string]any
 	if err := json.Unmarshal(raw, &payload); err == nil {
 		for _, key := range []string{"msg", "message"} {

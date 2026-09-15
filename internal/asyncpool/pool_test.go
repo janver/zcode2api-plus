@@ -3,11 +3,13 @@
 package asyncpool
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -27,10 +29,10 @@ import (
 // fakeSolver 依次返回预置令牌；tokens 耗尽时回退默认令牌（不关注
 // 验证码内容的用例可直接使用），err 非空时始终报错。
 type fakeSolver struct {
-	mu       sync.Mutex
-	tokens   []string
-	err      error
-	calls    int
+	mu     sync.Mutex
+	tokens []string
+	err    error
+	calls  int
 }
 
 func (s *fakeSolver) Solve(ctx context.Context, cfg captcha.Config) (string, error) {
@@ -397,6 +399,90 @@ func TestMessagesAcceptsWhitelistedModel(t *testing.T) {
 	}
 }
 
+// TestSkipsAPIKeyAccountsInMixedPool 混合池里轮到 apiKey 账号时应跳过，
+// 而不是终止整张票。
+//
+// async 仅支持 JWT 账号，但池中可以混有 apiKey 账号；Select 是 round-robin，
+// 一次只回一个。曾经的写法是「非 jwt 就 emitError 并 return」，且 tried 标记
+// 在检查之后，于是轮询再次轮到同一 apiKey 账号时依旧失败——池里明明有可用
+// JWT 账号，请求却间歇性、与账号状态无关地失败。
+func TestSkipsAPIKeyAccountsInMixedPool(t *testing.T) {
+	p, st, _, _ := newTestPool(t)
+
+	// 交错添加，确保 Select 的轮询顺序里 apiKey 账号排在 JWT 之前
+	if _, err := st.AddAccount(model.ProviderZai, "key-1", "sk-plain-key"); err != nil {
+		t.Fatal(err)
+	}
+	addJWTAccount(t, st, "jwt-1")
+
+	// 每次请求都要一个成功规格（scriptedUpstream 用完后回退 502）
+	okSpec := upstreamSpec{status: http.StatusOK, contentType: "text/event-stream", lines: []string{
+		`data: {"type":"message_delta","usage":{"output_tokens":1}}`,
+	}}
+	up := &scriptedUpstream{specs: []upstreamSpec{okSpec, okSpec, okSpec, okSpec}}
+	config.UpstreamZai = up.start(t).URL
+
+	// 多跑几次：无论轮询从哪个账号开始，都必须落到 JWT 账号上
+	for i := range 4 {
+		id := fmt.Sprintf("ticket-mixed-%d", i)
+		tk := insertTicket(p, id, map[string]any{"model": "GLM-5.3", "messages": []any{}})
+		p.processTicket(context.Background(), id)
+
+		events := drainEvents(tk)
+		last := events[len(events)-1]
+		if last.Type != "done" {
+			t.Fatalf("第 %d 次：应跳过 apiKey 账号并成功交付，实际 %+v", i, events)
+		}
+	}
+	if up.callCount() == 0 {
+		t.Fatal("上游应收到请求")
+	}
+}
+
+// TestSuccessRecordsUsageAndRevivesStatus async 成功交付后必须与 engine.success
+// 记出相同的账号状态。
+//
+// 曾只累加 token：后台用量页漏算 async 流量，且冷却到期的账号即使这里已经
+// 成功返回，状态仍停在 cooling，只能等下一轮额度轮询（默认 60s）才恢复调度。
+func TestSuccessRecordsUsageAndRevivesStatus(t *testing.T) {
+	p, st, _, _ := newTestPool(t)
+	acc := addJWTAccount(t, st, "revive")
+
+	// 制造「冷却已到期」的前置状态：这是最需要被成功路径复位的情形
+	pastCooling := float64(time.Now().Add(-time.Minute).UnixNano()) / 1e9
+	msg := "上游限流 HTTP 429"
+	st.Update(acc.Provider, acc.ID, func(a *model.Account) {
+		a.Status = model.StatusCooling
+		a.CoolingUntil = &pastCooling
+		a.LastError = &msg
+	})
+
+	up := &scriptedUpstream{specs: []upstreamSpec{
+		{status: http.StatusOK, contentType: "text/event-stream", lines: []string{
+			`data: {"type":"message_start","message":{"usage":{"input_tokens":7}}}`,
+			`data: {"type":"message_delta","usage":{"output_tokens":3}}`,
+		}},
+	}}
+	config.UpstreamZai = up.start(t).URL
+
+	insertTicket(p, "ticket-success", map[string]any{"model": "GLM-5.3", "messages": []any{}})
+	p.processTicket(context.Background(), "ticket-success")
+
+	got := st.Find(model.ProviderZai, acc.ID)
+	if got.UseCount != 1 {
+		t.Fatalf("成功交付应累计 use_count（与 engine 一致）: %d", got.UseCount)
+	}
+	if got.LastUsedAt == nil {
+		t.Fatal("成功交付应写入 last_used_at")
+	}
+	if got.Status != model.StatusActive {
+		t.Fatalf("成功后应复位为 active: %s", got.Status)
+	}
+	if got.TotalInputTokens != 7 || got.TotalOutputTokens != 3 {
+		t.Fatalf("token 统计不符: in=%d out=%d", got.TotalInputTokens, got.TotalOutputTokens)
+	}
+}
+
 func TestSSEDoneReleasesTicket(t *testing.T) {
 	// 正常 done 事件後同樣要釋放 ticket，不得殘留。
 	p, _, _, _ := newTestPool(t)
@@ -442,6 +528,38 @@ func TestClientDisconnectReleasesTicket(t *testing.T) {
 	}
 }
 
+// 票务逾时必须显式投递终止事件，否则客户端只看到连接关闭，
+// 无法区分「已完成」与「被超时截断」。
+func TestTicketTimeoutEmitsErrorEvent(t *testing.T) {
+	p, _, _, _ := newTestPool(t)
+	old := config.AsyncTicketTimeout
+	config.AsyncTicketTimeout = 30 // 下限；用 createdAt 回拨触发立即逾时
+	t.Cleanup(func() { config.AsyncTicketTimeout = old })
+
+	tk := insertTicket(p, "ticket-timeout", map[string]any{"messages": []any{}})
+	tk.createdAt = time.Now().Add(-time.Duration(config.AsyncTicketTimeout+1) * time.Second)
+
+	var out []string
+	p.streamTicket(context.Background(), func(s string) error {
+		out = append(out, s)
+		return nil
+	}, "ticket-timeout")
+
+	if len(out) == 0 {
+		t.Fatal("逾时应至少投递 ticket 事件与终止事件")
+	}
+	last := out[len(out)-1]
+	if !strings.Contains(last, "event: error") || !strings.Contains(last, "ticket_timeout") {
+		t.Fatalf("逾时应投递 ticket_timeout 错误事件: %q", last)
+	}
+	p.mu.Lock()
+	remaining := len(p.tickets)
+	p.mu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("逾时后应释放票务: %d", remaining)
+	}
+}
+
 func TestReleaseTicketIgnoresUnknownIDAndFinishedTask(t *testing.T) {
 	// 未知 id 與已結束任務都應安全跳過。
 	p, _, _, _ := newTestPool(t)
@@ -469,7 +587,7 @@ func TestSweepRemovesExpiredOrphansAndKeepsFresh(t *testing.T) {
 		status: "pending",
 		queue:  make(chan ticketEvent, 1),
 		createdAt: time.Now().Add(-time.Duration(config.AsyncTicketTimeout)*time.Second -
-			120 * time.Second),
+			120*time.Second),
 	}
 	p.mu.Lock()
 	p.tickets["ticket-stale"] = stale
@@ -498,7 +616,7 @@ func TestNewTicketSweepsOrphans(t *testing.T) {
 		status: "pending",
 		queue:  make(chan ticketEvent, 1),
 		createdAt: time.Now().Add(-time.Duration(config.AsyncTicketTimeout)*time.Second -
-			120 * time.Second),
+			120*time.Second),
 	}
 	p.mu.Lock()
 	p.tickets["ticket-stale"] = stale
@@ -655,6 +773,97 @@ func TestRateLimitMarksCoolingAndRetries(t *testing.T) {
 	}
 }
 
+// TestAccountProxyIsUsed 账号配置的 proxy_url 必须作用于 async 路径。
+//
+// README 与 PLAN §5.9 都承诺「该账号的网关请求、额度查询与套餐领取均走对应
+// 代理」。async 池曾忽略 proxy_url 直接出站：配置代理的账号在这条路径上以
+// 服务器真实 IP 连上游，正是使用者配置代理要规避的（IP 绑定、地区限制、风控）。
+// TestAccountProxyIsUsed 账号配置的 proxy_url 必须作用于 async 路径。
+//
+// README 与 PLAN §5.9 都承诺「该账号的网关请求、额度查询与套餐领取均走对应
+// 代理」。async 池曾忽略 proxy_url 直接出站：配置代理的账号在这条路径上以
+// 服务器真实 IP 连上游，正是使用者配置代理要规避的（IP 绑定、地区限制、风控）。
+func TestAccountProxyIsUsed(t *testing.T) {
+	p, st, _, _ := newTestPool(t)
+	acc := addJWTAccount(t, st, "proxied")
+
+	up := &scriptedUpstream{specs: []upstreamSpec{
+		{status: http.StatusOK, contentType: "text/event-stream", lines: []string{
+			`data: {"type":"message_delta","usage":{"output_tokens":1}}`,
+		}},
+	}}
+	config.UpstreamZai = up.start(t).URL
+
+	// 最小 CONNECT 代理：记录被请求的目标，再把连接原样转发到真实上游。
+	// 用裸 TCP listener 而非 httptest，因为 CONNECT 需要接管连接（Hijack）。
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	var mu sync.Mutex
+	var connects []string
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				br := bufio.NewReader(c)
+				req, err := http.ReadRequest(br)
+				if err != nil {
+					return
+				}
+
+				// 明文 http 目标走绝对 URI（Proxy 字段的标准行为），
+				// https 目标才走 CONNECT；两种都记为该代理被使用。
+				target := req.Host
+				if target == "" {
+					target = req.URL.Host
+				}
+				mu.Lock()
+				connects = append(connects, target)
+				mu.Unlock()
+
+				// 把请求原样转发到真实上游并回传响应
+				outReq := req.Clone(context.Background())
+				outReq.RequestURI = ""
+				if outReq.URL.Host == "" {
+					outReq.URL.Host = target
+				}
+				resp, err := http.DefaultTransport.RoundTrip(outReq)
+				if err != nil {
+					return
+				}
+				defer resp.Body.Close()
+				_ = resp.Write(c)
+			}(conn)
+		}
+	}()
+
+	st.Update(acc.Provider, acc.ID, func(a *model.Account) {
+		proxyURL := "http://" + ln.Addr().String()
+		a.ProxyURL = &proxyURL
+	})
+
+	tk := insertTicket(p, "ticket-proxy", map[string]any{"model": "GLM-5.3", "messages": []any{}})
+	p.processTicket(context.Background(), "ticket-proxy")
+	_ = drainEvents(tk)
+
+	mu.Lock()
+	gotConnects := len(connects)
+	mu.Unlock()
+	if gotConnects == 0 {
+		t.Fatalf("账号配置了代理，请求却未经代理出站（上游调用=%d）", up.callCount())
+	}
+	if up.callCount() == 0 {
+		t.Fatal("上游应收到请求")
+	}
+}
+
 func TestSSEJSONEscapesNonASCII(t *testing.T) {
 	// sseJSON 对齐 Python json.dumps 默认 ensure_ascii=True。
 	got := sseJSON(map[string]any{"id": "中文", "n": float64(3)})
@@ -669,4 +878,137 @@ func TestSSEJSONEscapesNonASCII(t *testing.T) {
 	if !strings.Contains(got, "<a>&</a>") {
 		t.Fatalf("HTML 字符不应转义: %s", got)
 	}
+}
+
+// async 路径必须与 engine 用同一套分类：429 的额度上限码族标「该模型耗尽」，
+// 而非一律标 cooling（曾因两条路径各自实现而分歧）。
+// TestJSONBusinessErrorIsNotTreatedAsStream 上游用 HTTP 200 包装业务错误时，
+// 不得当成成功串流交付。
+//
+// ZCode 有时在 200 里回 {"code":1005,...}（每日额度用完）。引擎有专门的
+// content-type 分支处理它；async 曾直接 forwardSSE，于是客户端收到
+// ready→done 的「成功」串流但零 chunk，账号也不被标状态——额度耗尽的账号
+// 会一直留在轮询池里被反复选中、反复白耗上游请求。
+func TestJSONBusinessErrorIsNotTreatedAsStream(t *testing.T) {
+	p, st, _, _ := newTestPool(t)
+	addJWTAccount(t, st, "daily-exhausted")
+
+	up := &scriptedUpstream{specs: []upstreamSpec{
+		{status: http.StatusOK, contentType: "application/json",
+			body: `{"code":1005,"msg":"exceed quota limit"}`},
+	}}
+	config.UpstreamZai = up.start(t).URL
+
+	tk := insertTicket(p, "ticket-1005", map[string]any{"model": "GLM-5.3", "messages": []any{}})
+	p.processTicket(context.Background(), "ticket-1005")
+	events := drainEvents(tk)
+
+	// 不得出现 chunk 或 done：这不是一次成功交付
+	for _, ev := range events {
+		if ev.Type == "chunk" || ev.Type == "done" {
+			t.Fatalf("业务错误不应交付为成功串流: %+v", events)
+		}
+	}
+	// 账号必须被标记该模型耗尽（与 engine 一致），否则会被反复选中
+	acc := st.ListAccounts(model.ProviderZai)[0]
+	if !containsStr(acc.ExhaustedModels, "glm-5.3") {
+		t.Fatalf("应标记模型耗尽: status=%s exhausted=%v", acc.Status, acc.ExhaustedModels)
+	}
+}
+
+// TestJSONNonZeroCodeDeliveredAsError 其余业务码应作为 error 事件投递，
+// 且携带上游 msg，而不是静默变成「成功但零 chunk」。
+func TestJSONNonZeroCodeDeliveredAsError(t *testing.T) {
+	p, st, _, _ := newTestPool(t)
+	addJWTAccount(t, st, "biz-err")
+
+	up := &scriptedUpstream{specs: []upstreamSpec{
+		{status: http.StatusOK, contentType: "application/json",
+			body: `{"code":1234,"msg":"something went wrong"}`},
+	}}
+	config.UpstreamZai = up.start(t).URL
+
+	tk := insertTicket(p, "ticket-biz", map[string]any{"model": "GLM-5.3", "messages": []any{}})
+	p.processTicket(context.Background(), "ticket-biz")
+	events := drainEvents(tk)
+
+	last := events[len(events)-1]
+	if last.Type != "error" {
+		t.Fatalf("业务错误应投递 error 事件: %+v", events)
+	}
+	errObj, _ := last.Data.(map[string]any)["error"].(map[string]any)
+	if errObj == nil || errObj["type"] != "upstream_error" {
+		t.Fatalf("错误类型应为 upstream_error: %v", last.Data)
+	}
+	if msg, _ := errObj["message"].(string); msg != "something went wrong" {
+		t.Fatalf("应取上游 msg 字段: %v", errObj["message"])
+	}
+}
+
+func TestQuotaExhaustedCodeMarksModelNotCooling(t *testing.T) {
+	p, st, _, _ := newTestPool(t)
+	addJWTAccount(t, st, "quota-acc")
+
+	up := &scriptedUpstream{specs: []upstreamSpec{
+		{status: http.StatusTooManyRequests, body: `{"code":1310,"msg":"weekly limit"}`},
+	}}
+	config.UpstreamZai = up.start(t).URL
+
+	insertTicket(p, "ticket-quota", map[string]any{"model": "GLM-5.3", "messages": []any{}})
+	p.processTicket(context.Background(), "ticket-quota")
+
+	acc := st.ListAccounts(model.ProviderZai)[0]
+	if acc.Status == model.StatusCooling {
+		t.Fatalf("额度上限码族不应标 cooling（应与 engine 一致）: %s", acc.Status)
+	}
+	if !containsStr(acc.ExhaustedModels, "glm-5.3") {
+		t.Fatalf("应标记该模型耗尽（正規化為小寫）: %v", acc.ExhaustedModels)
+	}
+}
+
+// 401 应标 invalid（账号失效），不得落入冷却分支。
+func TestUnauthorizedMarksInvalid(t *testing.T) {
+	p, st, _, _ := newTestPool(t)
+	addJWTAccount(t, st, "bad-acc")
+
+	up := &scriptedUpstream{specs: []upstreamSpec{
+		{status: http.StatusUnauthorized, body: ""},
+	}}
+	config.UpstreamZai = up.start(t).URL
+
+	insertTicket(p, "ticket-401", map[string]any{"model": "GLM-5.3", "messages": []any{}})
+	p.processTicket(context.Background(), "ticket-401")
+
+	acc := st.ListAccounts(model.ProviderZai)[0]
+	if acc.Status != model.StatusInvalid {
+		t.Fatalf("401 应标 invalid: %s", acc.Status)
+	}
+}
+
+// 3010 并发准入限制：账号仍可用，不得标 cooling 或 invalid。
+func TestConcurrencyLimitKeepsAccountState(t *testing.T) {
+	p, st, _, _ := newTestPool(t)
+	addJWTAccount(t, st, "busy-acc")
+
+	up := &scriptedUpstream{specs: []upstreamSpec{
+		{status: http.StatusTooManyRequests, body: `{"code":3010,"msg":"model admission concurrency limit"}`},
+	}}
+	config.UpstreamZai = up.start(t).URL
+
+	insertTicket(p, "ticket-3010", map[string]any{"model": "GLM-5.3", "messages": []any{}})
+	p.processTicket(context.Background(), "ticket-3010")
+
+	acc := st.ListAccounts(model.ProviderZai)[0]
+	if acc.Status != model.StatusActive {
+		t.Fatalf("3010 不应改变账号状态（当前 %s）", acc.Status)
+	}
+}
+
+func containsStr(list []string, want string) bool {
+	for _, s := range list {
+		if s == want {
+			return true
+		}
+	}
+	return false
 }

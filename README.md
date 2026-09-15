@@ -26,7 +26,7 @@ Z.AI ZCode Coding Plan → OpenAI/Anthropic 兼容網關（**Go 版，現為主�
 ## 快速開始
 
 ```bash
-# 下載現成產物（Releases 頁：linux / darwin / windows × amd64 / arm64）
+# 下載現成產物（Releases 頁：linux × amd64/arm64、darwin × amd64/arm64、windows × amd64）
 # 或源碼構建：
 go build -o zcode2api ./cmd/zcode2api
 ./zcode2api serve            # http://127.0.0.1:3000
@@ -84,25 +84,25 @@ docker compose pull && docker compose up -d
 docker compose down
 ```
 
-配置文件见 [`docker-compose.yml`](docker-compose.yml)。默认使用 GHCR 发布镜像，
-`zcode-data` 持久化账号数据库与设备指纹，`zcode-browser` 持久化自动下载的 Chromium。
-首次触发验证码时才会下载浏览器，服务器需要能够访问 `cloakbrowser.dev`；
-`ZCODE_CAPTCHA_BROWSER=true` 时启用自动浏览器求解，失败后回退人工回填。
+配置文件见 [`docker-compose.yml`](docker-compose.yml)。默认使用 GHCR 发布镜像
+（推 `v*` tag 后 CI 自动构建双架构镜像并推送），账号数据库与设备指纹、
+自动下载的 Chromium 均持久化；首次触发验证码时才下载浏览器，服务器需要
+能够访问 `cloakbrowser.dev`；`ZCODE_CAPTCHA_BROWSER=true` 时启用自动浏览器
+求解，失败后回退人工回填。
 
-> ⚠️ 数据卷的两种挂法：
-> - **named volume**（默认配置）：无需额外操作。
-> - **bind mount**（如 `./zcode-data:/data`）：容器以非 root 用户 `appuser`
->   （uid 10001）运行，宿主机目录必须先授权，否则启动会报
->   `存储初始化失败: unable to open database file (14)`：
+> ⚠️ 数据卷为 bind mount：容器以非 root 用户 `appuser`（uid 10001）运行，
+> 宿主机目录必须先授权，否则启动会报
+> `存储初始化失败: unable to open database file (14)`：
 >
->   ```bash
->   sudo chown -R 10001:10001 ./zcode-data ./zcode-browser
->   ```
+> ```bash
+> sudo chown -R 10001:10001 ./zcode-data ./zcode-browser
+> ```
+>
+> 若改回 named volume（`zcode-data:/data`）则无需任何额外操作。
 
-## 部署（Docker，推薦）
+也可用裸 `docker run`：
 
 ```bash
-# 推 v* tag 後 CI 自動構建 linux/amd64 + linux/arm64 雙架構鏡像並推送到 GHCR
 docker run -d --name zcode2api -p 3000:3000 \
   -v zcode-data:/data \
   -e ZCODE_ADMIN_KEY=改成你的後台密碼 \
@@ -110,28 +110,41 @@ docker run -d --name zcode2api -p 3000:3000 \
   ghcr.io/janver/zcode2api-plus:latest
 ```
 
-鏡像內為單靜態二進制（前端已內嵌），數據持久化在 `/data` 卷；
-驗證碼瀏覽器模式加 `-e ZCODE_CAPTCHA_BROWSER=true`，補丁 Chromium
-首次啟動自動下載（緩存於容器內 `~/.cloakbrowser`，可另掛卷持久化）。
+## 部署（Linux 一鍵腳本）
 
-## 部署（裸二進制 + systemd，推薦）
+交互式管理腳本與本地構建 Docker 方案見 [`deploy/README.md`](deploy/README.md)。
 
-```ini
-# /etc/systemd/system/zcode2api.service
-[Service]
-WorkingDirectory=/opt/zcode2api
-Environment=ZCODE_PORT=3010
-Environment=ZCODE_DATA_DIR=/opt/zcode2api/data
-Environment=ZCODE_CAPTCHA_BROWSER=true
-ExecStart=/opt/zcode2api/zcode2api serve
-Restart=on-failure
+```bash
+sudo ./deploy/manage.sh            # 交互式選單：安裝/更新/卸載/狀態/服務控制
 ```
 
-> 💡 驗證碼瀏覽器：啟動時自動從 cloakbrowser.dev 下載補丁 Chromium（SHA256SUMS +
-> Ed25519 簽名校驗，GitHub Releases 兜底），緩存於 `~/.cloakbrowser/`，零 Python 依賴。
-> 下載源可用 `CLOAKBROWSER_DOWNLOAD_URL` 覆蓋；`ZCODE_CAPTCHA_BROWSER_BIN` 可指向
-> 任意已有瀏覽器。實測部分發行版自帶 Chromium（如 Debian 150）會被風控拒絕——
-> 自動下載的補丁二進制即為此問題的內建解法。
+或非交互：
+
+```bash
+sudo ./deploy/manage.sh install                # 二進制 + systemd（已實測）
+sudo ./deploy/manage.sh install --port 3010 --user zcode
+sudo ./deploy/manage.sh update                 # 更新（自動比對 Release 版本）
+sudo ./deploy/manage.sh uninstall              # 卸載（--purge 連數據刪除）
+sudo ./deploy/manage.sh docker-install         # Docker（本地構建，未驗證）
+```
+
+安裝完成後自動啟動服務，**首次啟動的後台密碼與網關 API Key 只顯示一次，請立即保存**。
+
+> ⚠️ 上游 `deploy/` 的**本地構建** Docker 方案未經驗證，不保證可用（詳見
+> [`deploy/README.md`](deploy/README.md)）。本 fork 的 GHCR 鏡像路徑（上一節）
+> 已經 CI 雙架構構建與實測，優先使用。
+
+> 💡 驗證碼瀏覽器：首次使用時自動從 cloakbrowser.dev 下載補丁 Chromium
+> （SHA256SUMS + Ed25519 簽名校驗，GitHub Releases 兜底），緩存於
+> `CLOAKBROWSER_CACHE_DIR`，零 Python 依賴。`manage.sh` 會一併裝好其系統依賴
+> （按發行版命名差異自動解析）。下載源可用 `CLOAKBROWSER_DOWNLOAD_URL` 覆蓋；
+> `ZCODE_CAPTCHA_BROWSER_BIN` 可指向任意已有瀏覽器。實測部分發行版自帶的
+> Chromium（如 Debian 13）會被風控拒絕——自動下載的補丁二進制即為此問題的內建解法。
+
+> ⚠️ 放在反向代理後時注意：後台登入失敗限速以 `RemoteAddr` 為鍵，不信任
+> `X-Forwarded-For`（防偽造），因此反代後所有客戶端會共用同一失敗桶
+> （5 分鐘 10 次即整站 429）。**解法**：以 `--host 127.0.0.1` 安裝，讓服務只監聽
+> 回環、僅由本機反代轉發，詳見 [`deploy/README.md`](deploy/README.md)。
 
 ## 配置（環境變量）
 
@@ -143,7 +156,7 @@ Restart=on-failure
 | `ZCODE_DATA_DIR` | `./data` | 賬號庫、密鑰、設備指紋 |
 | `ZCODE_CAPTCHA_BROWSER` | false | 啟用 rod 瀏覽器池自動求解 |
 | `ZCODE_CAPTCHA_BROWSER_BIN` | 自動發現 | Chromium 二進制路徑 |
-| `ZCODE_ASYNC_ENABLED` | — | 掛載 /async/v1/messages 空閒池 |
+| `ZCODE_ASYNC_ENABLED` | true | 掛載 /async/v1/messages 空閒池 |
 
 ## 賬號級出站代理
 
@@ -159,8 +172,12 @@ JWT 賬號入池（批量添加 / OAuth / CLI login）後自動：激活事件�
 
 ## 發佈與開發
 
-- 推 `v*` tag → GitHub Actions 自動交叉編譯五平台產物並上傳 Releases。
-- 全量驗證：`go build ./... && go vet ./... && go test ./...`；併發檢查 `go test -race ./...`。
+- 推 `v*` tag → GitHub Actions 自動交叉編譯五平台產物（linux/amd64、linux/arm64、
+  darwin/amd64、darwin/arm64、windows/amd64）並上傳 Releases。
+- 全量驗證：`go build ./... && go vet ./... && go test ./...`；併發檢查 `go test -race ./...`
+  （需 C 工具鏈）。
+- 前端改動：`cd frontend && npm install && npm run build`，並把更新後的 `frontend/dist` 一併提交
+  （`dist` 已入庫並由 `go:embed` 打包）。
 - 行為契約與里程碑台账見 `PLAN.md`；交接注意事項見 `HANDOFF.md`。
 
 ## 賬號歸檔

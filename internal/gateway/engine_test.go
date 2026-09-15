@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -39,9 +40,9 @@ type fixture struct {
 	cm       *captcha.Manager
 	eng      *Engine
 
-	mu       sync.Mutex
-	calls    []upstreamCall
-	respond  responder
+	mu      sync.Mutex
+	calls   []upstreamCall
+	respond responder
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -140,9 +141,9 @@ func (f *fixture) post(t *testing.T, body map[string]any, key string) (int, stri
 
 func msgBody() map[string]any {
 	return map[string]any{
-		"model":     "GLM-5.3",
+		"model":      "GLM-5.3",
 		"max_tokens": 8,
-		"messages":  []any{map[string]any{"role": "user", "content": "hi"}},
+		"messages":   []any{map[string]any{"role": "user", "content": "hi"}},
 	}
 }
 
@@ -297,6 +298,63 @@ func Test402MarksModelExhausted(t *testing.T) {
 	}
 }
 
+// TestMarkModelExhaustedDoesNotClobberStrongerStatus 额度信号不得覆盖
+// invalid/cooling/disabled——它们由凭据校验或上游限流直接判定。
+//
+// Store.Select 不做占位保留，同一账号可被并发请求同时选中：A 被上游 401
+// 标 invalid 后，B 的 402 额度信号曾无条件把状态刷回 active，失效账号立刻
+// 回到轮询池，每次选中都白耗一次上游调用。cooling 同理会提前解除。
+func TestMarkModelExhaustedDoesNotClobberStrongerStatus(t *testing.T) {
+	cases := []struct {
+		name   string
+		status string
+	}{
+		{"invalid 不被覆盖", model.StatusInvalid},
+		{"cooling 不被覆盖", model.StatusCooling},
+		{"disabled 不被覆盖", model.StatusDisabled},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := newFixture(t)
+			acc, err := f.st.AddAccount(model.ProviderZai, "acc", "sk-1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			until := float64(time.Now().Add(time.Minute).UnixNano()) / 1e9
+			prevMsg := "先前状态"
+			f.st.Update(acc.Provider, acc.ID, func(a *model.Account) {
+				a.Status = c.status
+				if c.status == model.StatusCooling {
+					a.CoolingUntil = &until
+				}
+				a.LastError = &prevMsg
+			})
+
+			MarkModelExhausted(f.st, acc.Provider, acc.ID, "GLM-5.3", "額度已用完")
+
+			got := f.st.Find(model.ProviderZai, acc.ID)
+			if got.Status != c.status {
+				t.Fatalf("状态不应被额度信号改写: %s -> %s", c.status, got.Status)
+			}
+			if c.status == model.StatusCooling {
+				if got.CoolingUntil == nil {
+					t.Fatal("cooling 的截止时间不应被清空")
+				}
+			}
+			// 模型级标记仍要生效，否则该模型不会被摘出轮询
+			found := false
+			for _, m := range got.ExhaustedModels {
+				if m == "glm-5.3" {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("模型应仍被标记耗尽: %v", got.ExhaustedModels)
+			}
+		})
+	}
+}
+
 func Test429QuotaFamilyExhaustsAndRateLimitCools(t *testing.T) {
 	t.Run("1310 用量上限族→模型耗尽", func(t *testing.T) {
 		f := newFixture(t)
@@ -441,6 +499,119 @@ func TestJWTWithoutSolverReturnsCaptchaRequired(t *testing.T) {
 	}
 }
 
+// TestConcurrentRequestsAccountState 并发压测：多个请求同时打同一账号池，
+// 验证账号状态更新（use_count / token 统计）不丢失。
+//
+// 每个成功请求恰好累计一次，并发下丢更新会直接反映为数值偏小——这是
+// 「状态写入必须经 Store.Update 在锁内完成」的行为契约。
+func TestConcurrentRequestsAccountState(t *testing.T) {
+	f := newFixture(t)
+	f.respond = jsonResp(200, okUpstreamJSON)
+
+	const accounts = 4
+	const requests = 40
+	for i := range accounts {
+		acc, err := f.st.AddAccount(model.ProviderZai, fmt.Sprintf("acc-%d", i), fmt.Sprintf("sk-%d", i))
+		if err != nil {
+			t.Fatal(err)
+		}
+		// quota 需在锁内写入，Select 才会认为该模型可用
+		f.st.Update(acc.Provider, acc.ID, func(a *model.Account) {
+			a.Quota = map[string]map[string]any{
+				"GLM-5.3": {"remaining": float64(1000), "model": "GLM-5.3"},
+			}
+		})
+	}
+
+	var wg sync.WaitGroup
+	for i := range requests {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			// 第三个参数是网关密钥（所有请求相同）；账号由引擎轮询选中
+			status, _ := f.post(t, msgBody(), "sk-test")
+			if status != 200 {
+				t.Errorf("请求 %d 应 200: %d", i, status)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	// 每个成功请求恰好累计一次：use_count 与 token 统计都必须精确，
+	// 并发下丢更新会直接反映为数值偏小。
+	totalUse, totalIn, totalOut := 0, 0, 0
+	for _, a := range f.st.ListAccounts(model.ProviderZai) {
+		totalUse += a.UseCount
+		totalIn += a.TotalInputTokens
+		totalOut += a.TotalOutputTokens
+	}
+	if totalUse != requests {
+		t.Fatalf("use_count 合计应为 %d（并发丢更新？）: %d", requests, totalUse)
+	}
+	if totalIn != requests*11 || totalOut != requests*22 {
+		t.Fatalf("token 统计不符: in=%d out=%d（期望 %d/%d）",
+			totalIn, totalOut, requests*11, requests*22)
+	}
+}
+
+// TestClientCancelDoesNotCoolAccounts 客户端中断不得污染账号状态。
+//
+// 中断会让 ctx 取消，Do 随即返回 context.Canceled；若把它当成「连接失败」，
+// 重试循环会把每个被选中的账号各标一次冷却（默认 300s）并落库——小账号池
+// 几次 Ctrl-C 就全池不可用，所有请求 503。中断与账号健康无关，必须不写状态。
+func TestClientCancelDoesNotCoolAccounts(t *testing.T) {
+	f := newFixture(t)
+
+	// 上游阻塞到 ctx 取消为止，确保取消发生在请求进行中
+	blocked := make(chan struct{})
+	f.respond = func(int, *http.Request) (int, http.Header, string) {
+		<-blocked
+		return 200, http.Header{"Content-Type": []string{"application/json"}}, okUpstreamJSON
+	}
+	defer close(blocked)
+
+	const accounts = 3
+	for i := range accounts {
+		if _, err := f.st.AddAccount(model.ProviderZai, fmt.Sprintf("acc-%d", i), fmt.Sprintf("sk-%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan runResult, 1)
+	go func() {
+		done <- f.eng.RunMessages(ctx, msgBody(), map[string]string{}, func(Delivery) error { return nil })
+	}()
+
+	// 等上游真的被调用后再取消，模拟客户端中途断开
+	deadline := time.After(5 * time.Second)
+	for f.callCount() == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("上游未被调用")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("取消后引擎未返回")
+	}
+
+	// 核心断言：没有任何账号被标记为冷却或其他异常状态
+	for _, a := range f.st.ListAccounts(model.ProviderZai) {
+		if a.Status != model.StatusActive {
+			t.Fatalf("账号 %s 状态被中断污染: %s (%v)", a.Name, a.Status, a.LastError)
+		}
+		if a.CoolingUntil != nil {
+			t.Fatalf("账号 %s 不应有冷却截止时间", a.Name)
+		}
+	}
+}
+
 func TestModelsEndpoint(t *testing.T) {
 	f := newFixture(t)
 	// Python 版 /v1/models 带 Depends(verify_gateway_key)，同样需要鉴权
@@ -458,9 +629,9 @@ func TestModelsEndpoint(t *testing.T) {
 	var payload struct {
 		Object string `json:"object"`
 		Data   []struct {
-			ID           string `json:"id"`
-			Type         string `json:"type"`
-			DisplayName  string `json:"display_name"`
+			ID          string `json:"id"`
+			Type        string `json:"type"`
+			DisplayName string `json:"display_name"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(raw, &payload); err != nil {

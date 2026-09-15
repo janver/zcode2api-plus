@@ -3,16 +3,21 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"zcode2api" // 嵌入的前端构建产物（仓库根包，受 go:embed 目录约束）
 
 	"zcode2api/internal/adminapi"
-	"zcode2api/internal/auth"
 	"zcode2api/internal/asyncpool"
+	"zcode2api/internal/auth"
 	"zcode2api/internal/captcha"
 	"zcode2api/internal/config"
 	"zcode2api/internal/gateway"
@@ -27,15 +32,20 @@ func main() {
 	if len(os.Args) > 1 {
 		os.Exit(runCLI(os.Args[1], os.Args[2:], serve))
 	}
-	serve()
+	if err := serve(); err != nil {
+		web.Err("main", "服务退出: "+err.Error())
+		os.Exit(1)
+	}
 }
 
 // serve 启动网关 + 后台管理 + SPA（对应 Python 版 main.py serve）。
-func serve() {
+//
+// 返回 error 而非直接 os.Exit：os.Exit 会跳过所有 defer，浏览器池
+// （Chromium 子进程）、SQLite 连接与监控循环都不会收尾。
+func serve() error {
 	st, err := store.New()
 	if err != nil {
-		web.Err("main", "存储初始化失败: "+err.Error())
-		os.Exit(1)
+		return fmt.Errorf("存储初始化失败: %w", err)
 	}
 	defer func() { _ = st.Close() }()
 
@@ -77,10 +87,53 @@ func serve() {
 	printBanner(st)
 
 	addr := fmt.Sprintf("%s:%d", config.Host, config.Port)
-	web.Ok("main", "服务运行中 "+addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
-		web.Err("main", "服务退出: "+err.Error())
-		os.Exit(1)
+	srv := newServer(addr, mux)
+
+	// 收到 SIGINT/SIGTERM 时优雅退出：Shutdown 停止接受新连接并等待在途请求，
+	// 返回后 defer 链才会执行（关闭浏览器池、DB、监控循环）。
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	errCh := make(chan error, 1)
+	go func() {
+		web.Ok("main", "服务运行中 "+addr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- err
+			return
+		}
+		errCh <- nil
+	}()
+
+	select {
+	case err := <-errCh:
+		return err
+	case <-ctx.Done():
+		web.Ok("main", "收到退出信号，正在收尾…")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			return fmt.Errorf("优雅退出超时: %w", err)
+		}
+		return <-errCh
+	}
+}
+
+// newServer 构造 HTTP 服务端。
+//
+// ReadHeaderTimeout 防 Slowloris（慢速发请求头占住连接）。
+// IdleTimeout 回收 keep-alive 空连接——它只作用于「响应已写完、等待下一个
+// 请求」的空闲期，与流式响应无关；不设则 net/http 会把读期限清空
+// （server.go: idleTimeout()==0 且 ReadTimeout==0 → SetReadDeadline(zero)），
+// 空闲连接永不回收，goroutine 与 fd 无界累积。
+//
+// WriteTimeout 保持零值：SSE 与 async 票务的响应阶段会持续数分钟，
+// 设了会在流中途掐断（部署文档的 proxy_read_timeout 3600s 即为此配合）。
+func newServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 30 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 }
 
@@ -117,7 +170,7 @@ func printBanner(st *store.Store) {
 }
 
 // displayHost 横幅展示用主机：通配地址在浏览器中不可直接访问，显示 127.0.0.1
-//（对齐 Python _display_host）。
+// （对齐 Python _display_host）。
 func displayHost() string {
 	switch config.Host {
 	case "", "0.0.0.0", "::":

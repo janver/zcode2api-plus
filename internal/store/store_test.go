@@ -2,8 +2,10 @@ package store
 
 import (
 	"encoding/json"
+	"errors"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -185,9 +187,11 @@ func TestSelectRotationAndModelFilter(t *testing.T) {
 	a1, _ := s.AddAccount(model.ProviderZai, "a1", "h1.p.s3")
 	a2, _ := s.AddAccount(model.ProviderZai, "a2", "h2.p.s3")
 	for _, a := range []*model.Account{a1, a2} {
-		a.Quota = map[string]map[string]any{
-			"GLM-5.3": {"remaining": float64(10), "model": "GLM-5.3"},
-		}
+		s.Update(a.Provider, a.ID, func(x *model.Account) {
+			x.Quota = map[string]map[string]any{
+				"GLM-5.3": {"remaining": float64(10), "model": "GLM-5.3"},
+			}
+		})
 	}
 
 	first := s.Select("zai", nil, "GLM-5.3")
@@ -209,11 +213,20 @@ func TestSelectRotationAndModelFilter(t *testing.T) {
 		t.Fatalf("available 空时应回退 unknown: %v", got)
 	}
 
-	// 模型额度耗尽的账号被排除
-	a2.Quota["GLM-5.3"]["remaining"] = float64(0)
-	got = s.Select("zai", nil, "GLM-5.3")
-	if got == nil || got.ID == a2.ID {
-		t.Fatalf("耗尽账号不应被选中: %v", got)
+	// 模型额度耗尽的账号被排除：必须多次轮询都选不到它。
+	// 只断言一次是不够的——rotation 游标恰好指向 a1 时，即使过滤逻辑失效
+	// 也会「通过」，那种断言无法保护这段逻辑。
+	s.Update(a2.Provider, a2.ID, func(x *model.Account) {
+		x.Quota["GLM-5.3"]["remaining"] = float64(0)
+	})
+	for range 6 {
+		got = s.Select("zai", nil, "GLM-5.3")
+		if got == nil {
+			t.Fatal("应选到 a1")
+		}
+		if got.ID == a2.ID {
+			t.Fatalf("耗尽账号不应被选中: %v", got.ID)
+		}
 	}
 	// 且耗尽账号不在 available 池 → available=[a1]；skip a1 后回退 unknown [a3]
 	got = s.Select("zai", map[string]bool{a1.ID: true}, "GLM-5.3")
@@ -229,13 +242,17 @@ func TestSelectPromoAccountsFirst(t *testing.T) {
 	plain, _ := s.AddAccount(model.ProviderZai, "plain", "h3.p.s3")
 	// promo1/2 持有未耗尽的一次性优惠；plain 只有每日额度。
 	for _, a := range []*model.Account{promo1, promo2} {
-		a.Quota = map[string]map[string]any{
-			"GLM-5.3": {"remaining": float64(500), "period": "one_time", "model": "GLM-5.3"},
+		s.Update(a.Provider, a.ID, func(x *model.Account) {
+			x.Quota = map[string]map[string]any{
+				"GLM-5.3": {"remaining": float64(500), "period": "one_time", "model": "GLM-5.3"},
+			}
+		})
+	}
+	s.Update(plain.Provider, plain.ID, func(x *model.Account) {
+		x.Quota = map[string]map[string]any{
+			"GLM-5.3": {"remaining": float64(10), "period": "daily", "model": "GLM-5.3"},
 		}
-	}
-	plain.Quota = map[string]map[string]any{
-		"GLM-5.3": {"remaining": float64(10), "period": "daily", "model": "GLM-5.3"},
-	}
+	})
 
 	// 优惠组内轮询，绝不落到 plain。
 	seen := map[string]bool{}
@@ -254,10 +271,53 @@ func TestSelectPromoAccountsFirst(t *testing.T) {
 	}
 
 	// 优惠全部耗尽 → 回落普通账号。
-	promo1.Quota["GLM-5.3"]["remaining"] = float64(0)
-	promo2.Quota["GLM-5.3"]["remaining"] = float64(0)
+	for _, a := range []*model.Account{promo1, promo2} {
+		s.Update(a.Provider, a.ID, func(x *model.Account) {
+			x.Quota["GLM-5.3"]["remaining"] = float64(0)
+		})
+	}
 	if acc := s.Select("zai", nil, "GLM-5.3"); acc == nil || acc.ID != plain.ID {
 		t.Fatalf("优惠耗尽后应选中普通账号: %v", acc)
+	}
+}
+
+// Update 的 fn 由调用方提供，一旦 panic 必须仍释放锁——否则整个 Store
+// 会永久死锁（所有请求都经过 Select/Update）。本测试在 panic 后继续调用
+// Store 方法，若锁未释放会直接卡死（由 -timeout 兜底）。
+func TestUpdatePanicReleasesLock(t *testing.T) {
+	s := newTestStore(t)
+	acc, err := s.AddAccount(model.ProviderZai, "boom", "h.p.s4")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("fn panic 应向外传播，不得被吞掉")
+			}
+		}()
+		s.Update(acc.Provider, acc.ID, func(*model.Account) {
+			panic("boom")
+		})
+	}()
+
+	// 锁必须已释放：下面的调用若阻塞即说明死锁
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if err := s.Update(acc.Provider, acc.ID, func(a *model.Account) {
+			a.UseCount = 7
+		}); err != nil {
+			t.Errorf("panic 后 Update 应正常工作: %v", err)
+		} else if got := s.Find(acc.Provider, acc.ID); got.UseCount != 7 {
+			t.Errorf("use_count 应已更新: %d", got.UseCount)
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("panic 后锁未释放，Store 已死锁")
 	}
 }
 
@@ -267,10 +327,11 @@ func TestUpdateDeletedAccountRejected(t *testing.T) {
 	if ok, _ := s.RemoveAccount(model.ProviderZai, acc.ID); !ok {
 		t.Fatal("删除失败")
 	}
-	// 模拟后台流长期持有旧对象、删除后回写：必须被拒绝而非复活
-	acc.UseCount = 999
-	if err := s.UpdateAccount(acc); err == nil {
-		t.Fatal("已删除账号的回写应报错")
+	// 模拟后台流长期持有旧 ID、删除后回写：Update 必须拒绝而非复活账号
+	if err := s.Update(acc.Provider, acc.ID, func(a *model.Account) {
+		a.UseCount = 999
+	}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("对已删除账号的 Update 应返回 ErrNotFound: %v", err)
 	}
 	if s.Find(model.ProviderZai, acc.ID) != nil {
 		t.Fatal("已删除账号不得复活")
@@ -314,10 +375,9 @@ func TestExportImportRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	acc.SetDisabledModels([]string{"glm-4.7"})
-	if err := s1.UpdateAccount(acc); err != nil {
-		t.Fatal(err)
-	}
+	s1.Update(acc.Provider, acc.ID, func(a *model.Account) {
+		a.SetDisabledModels([]string{"glm-4.7"})
+	})
 	payload := s1.Export()
 	data, err := json.Marshal(payload)
 	if err != nil {
@@ -398,4 +458,65 @@ func TestProxyProfiles(t *testing.T) {
 	if _, err := s.AssignProxyProfile(acc.ID, "proxy-nope"); err == nil {
 		t.Fatal("指派不存在的线路应报错")
 	}
+}
+
+// Select/ListAccounts/Find 返回深拷贝，调用方在锁外的字段读写不与
+// Store 内部状态竞争；状态更新一律经 Update 在锁内完成。
+// 本测试用高并发验证该契约（需 -race 才能判定）。
+func TestSelectAndMutateConcurrently(t *testing.T) {
+	s := newTestStore(t)
+	acc, err := s.AddAccount(model.ProviderZai, "acc", "h.p.s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Update(acc.Provider, acc.ID, func(a *model.Account) {
+		a.Quota = map[string]map[string]any{
+			"GLM-5.3": {"remaining": float64(10), "model": "GLM-5.3"},
+		}
+	})
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	// 读侧：模拟并发请求选号 + 遍历账号列表
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				if got := s.Select(model.ProviderZai, nil, "GLM-5.3"); got != nil {
+					// 锁外读副本字段：不应与写侧竞争
+					_ = got.Status
+					_ = got.UseCount
+				}
+				for _, a := range s.ListAccounts(model.ProviderZai) {
+					_ = a.Status
+				}
+			}
+		}
+	}()
+
+	// 写侧：模拟引擎标记账号状态（经 Update 在锁内完成）
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 2000; i++ {
+			s.Update(acc.Provider, acc.ID, func(a *model.Account) {
+				msg := "冷却中"
+				a.Status = model.StatusCooling
+				a.LastError = &msg
+				a.UseCount++
+				a.FailCount++
+			})
+			s.Update(acc.Provider, acc.ID, func(a *model.Account) {
+				a.Status = model.StatusActive
+			})
+		}
+		close(stop)
+	}()
+
+	wg.Wait()
 }

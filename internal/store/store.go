@@ -498,34 +498,42 @@ func (s *Store) AssignProxyProfile(accountID, profileID string) (bool, error) {
 // ── 账号读取 ────────────────────────────────────────────────────────────────
 
 // ListAccounts 列出账号；provider 为空表示全部。
+//
+// 返回深拷贝：调用方（后台监控、管理后台、CLI）会在锁外长期遍历，
+// 直接给出内部对象会让其字段读取与 Store 的写入竞争。需要改状态请用
+// Update（锁内修改），不要在副本上改字段——那不会落库。
 func (s *Store) ListAccounts(provider string) []*model.Account {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if provider != "" {
 		src := s.accounts[provider]
 		out := make([]*model.Account, len(src))
-		copy(out, src)
+		for i, a := range src {
+			out[i] = a.Clone()
+		}
 		return out
 	}
 	var out []*model.Account
 	for _, p := range Providers {
-		out = append(out, s.accounts[p]...)
+		for _, a := range s.accounts[p] {
+			out = append(out, a.Clone())
+		}
 	}
 	return out
 }
 
-// Find 按 provider + id/名称 查找账号。
+// Find 按 provider + id/名称 查找账号，返回深拷贝（nil 表示不存在）。
 func (s *Store) Find(provider, idOrName string) *model.Account {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.findLocked(provider, idOrName)
+	return s.findLocked(provider, idOrName).Clone()
 }
 
-// FindAny 按 id 在全部提供商中查找账号。
+// FindAny 按 id 在全部提供商中查找账号，返回深拷贝（nil 表示不存在）。
 func (s *Store) FindAny(idOrName string) *model.Account {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.findAnyLocked(idOrName)
+	return s.findAnyLocked(idOrName).Clone()
 }
 
 func (s *Store) findLocked(provider, idOrName string) *model.Account {
@@ -559,6 +567,8 @@ func (s *Store) allAccountsLocked() []*model.Account {
 // ── 账号增删改 ──────────────────────────────────────────────────────────────
 
 // AddAccount 添加账号；重复 token 直接返回既有账号（对齐 Python 版）。
+// 返回的是深拷贝：调用方拿到的对象与 Store 内部无共享，改它不会影响存储
+// （要改状态请用 Update）。返回 nil, nil 表示账号已存在且无需新建。
 func (s *Store) AddAccount(provider, name, secret string) (*model.Account, error) {
 	if _, ok := s.providersSet()[provider]; !ok {
 		return nil, fmt.Errorf("不支持的 provider: %s", provider)
@@ -568,14 +578,14 @@ func (s *Store) AddAccount(provider, name, secret string) (*model.Account, error
 	defer s.mu.Unlock()
 	for _, a := range s.accounts[provider] {
 		if a.Secret() != "" && a.Secret() == acc.Secret() {
-			return a, nil // 跳过重复 token
+			return a.Clone(), nil // 跳过重复 token
 		}
 	}
 	s.accounts[provider] = append(s.accounts[provider], acc)
 	if err := s.persistAccountLocked(acc); err != nil {
 		return nil, err
 	}
-	return acc, nil
+	return acc.Clone(), nil
 }
 
 func (s *Store) providersSet() map[string]bool {
@@ -609,16 +619,37 @@ func (s *Store) RemoveAccount(provider, idOrName string) (bool, error) {
 	return true, nil
 }
 
-// UpdateAccount 持久化某个账号的当前状态。
-func (s *Store) UpdateAccount(acc *model.Account) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	// 防御已删除账号复活：后台流/额度刷新可能长期持有旧对象，
-	// 若删除后完成回写，INSERT OR REPLACE 会把账号重新插回 SQLite。
-	if s.findLocked(acc.Provider, acc.ID) == nil {
-		return fmt.Errorf("账号已不存在，拒绝回写: %s", acc.ID)
+// Update 在锁内对指定账号执行修改并持久化。
+//
+// fn 收到的是 Store 内部持有的账号对象，字段读写全程在锁内完成，
+// 因此与 Select/ListAccounts 的读取不会竞争。并发路径应使用本方法
+// 而非「取指针 → 改字段 → UpdateAccount」。
+//
+// 返回 error 与其它写路径（SetEnabled/SetArchived/AddAccount 等）一致：
+// 账号不存在返回 ErrNotFound，落库失败返回底层错误。
+// 落库失败时内存状态已改（Store 内部对象是唯一的真相来源），
+// 但调用方应把错误报给用户，否则会出现「界面显示已保存、重启后回滚」。
+func (s *Store) Update(provider, id string, fn func(acc *model.Account)) error {
+	var failed error
+
+	// 内层闭包保留 defer 解锁：fn 由调用方提供，一旦 panic 必须仍释放锁，
+	// 否则整个 Store 会永久死锁。
+	ok := func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		acc := s.findLocked(provider, id)
+		if acc == nil {
+			return false
+		}
+		fn(acc)
+		failed = s.persistAccountLocked(acc)
+		return true
+	}()
+
+	if !ok {
+		return ErrNotFound
 	}
-	return s.persistAccountLocked(acc)
+	return failed
 }
 
 // SetEnabled 启用/禁用账号（禁用同时置 DISABLED 状态）。
@@ -670,6 +701,11 @@ func (s *Store) SetArchived(provider, idOrName string, archived bool) (bool, err
 // 有该模型余额的账号优先；尚无快照无法判断者仅作后备；
 // 快照中未提供此模型（absent）的账号一律排除。
 // skipIDs 保证同一次请求不会重复尝试已失败的账号。
+//
+// 返回的是**深拷贝**：调用方（网关引擎、async 池）会在锁外长时间持有它，
+// 若直接返回 Store 内部对象，其字段修改将与 Select 自身的加锁读取竞争
+// （Status 为字符串、CoolingUntil 为指针，撕裂读可致误判或崩溃）。
+// 状态修改须经 Store.Update，不要改这个副本。
 func (s *Store) Select(provider string, skipIDs map[string]bool, modelName string) *model.Account {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -717,7 +753,7 @@ func (s *Store) Select(provider string, skipIDs map[string]bool, modelName strin
 	idx := s.rotation[key] % len(pool)
 	acc := pool[idx]
 	s.rotation[key] = (idx + 1) % len(pool)
-	return acc
+	return acc.Clone()
 }
 
 func orStar(modelName string) string {
@@ -763,9 +799,9 @@ type exportAccount struct {
 
 // ExportPayload 导出格式（version 1，与 Python 版一致）。
 type ExportPayload struct {
-	Version    int                          `json:"version"`
-	ExportedAt float64                      `json:"exported_at"`
-	Providers  map[string][]exportAccount   `json:"providers"`
+	Version    int                        `json:"version"`
+	ExportedAt float64                    `json:"exported_at"`
+	Providers  map[string][]exportAccount `json:"providers"`
 }
 
 // Export 导出全部账号（含明文凭证，仅用于备份/迁移）。
@@ -776,7 +812,9 @@ func (s *Store) Export() ExportPayload {
 	for _, p := range Providers {
 		list := []exportAccount{}
 		for _, a := range s.accounts[p] {
-			disabled := a.DisabledModels
+			// 必须复制：直接别名会让内部切片的底层数组随 payload 逃出锁，
+			// 调用方之后改它就会与 Clone/Update 的读取并发。
+			disabled := model.CloneStrings(a.DisabledModels)
 			if disabled == nil {
 				disabled = []string{}
 			}
@@ -827,8 +865,9 @@ func (s *Store) ImportAccounts(payload ImportPayload) (int, error) {
 				return count, err
 			}
 			if item.DisabledModels != nil {
-				acc.SetDisabledModels(item.DisabledModels)
-				if err := s.UpdateAccount(acc); err != nil {
+				if err := s.Update(acc.Provider, acc.ID, func(a *model.Account) {
+					a.SetDisabledModels(item.DisabledModels)
+				}); err != nil {
 					return count, err
 				}
 			}

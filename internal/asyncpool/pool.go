@@ -24,6 +24,7 @@ import (
 	"zcode2api/internal/config"
 	"zcode2api/internal/gateway"
 	"zcode2api/internal/model"
+	"zcode2api/internal/proxy"
 	"zcode2api/internal/store"
 	"zcode2api/internal/upstream"
 	"zcode2api/internal/web"
@@ -93,6 +94,11 @@ func (p *Pool) handleAsyncMessages(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+
+	// 入口整形一次，与 /v1/messages 一致（去掉 provider/ 前缀、套用名称映射）。
+	// 缺了它，`anthropic/GLM-5.3` 这类写法在前者能过、在这里 400，
+	// 与「模型白名单与 /v1/messages 一致」的注释承诺不符。
+	gateway.NormalizeBody(body, false)
 
 	// 模型白名單與 /v1/messages 一致：僅開放清單內模型，其餘在建票前一律拒絕
 	if !gateway.ModelAllowed(body["model"]) {
@@ -175,6 +181,12 @@ func (p *Pool) streamTicket(ctx context.Context, write func(string) error, ticke
 			}
 		}
 	}
+	// 逾时：必须显式投递终止事件，否则客户端只看到连接关闭而无法区分
+	// 「已完成」与「被超时截断」（defer releaseTicket 会中止后台任务）。
+	_ = send("error", sseJSON(map[string]any{"error": map[string]any{
+		"message": fmt.Sprintf("请求超时（%d 秒未完成）", config.AsyncTicketTimeout),
+		"type":    "ticket_timeout",
+	}}))
 }
 
 // ── 票务生命周期 ────────────────────────────────────────────────────────────
@@ -266,8 +278,17 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 
 	for {
 		modelName, _ := body["model"].(string)
+
+		// async 仅支持 JWT 账号，但池中可以混有 apiKey 账号：Select 是
+		// round-robin，轮到 apiKey 账号时必须跳过并继续找下一个，而不是
+		// 直接终止整张票——否则池里明明有可用 JWT 账号，请求却间歇性失败。
+		// 先记 tried 再判断：漏记会让下一次轮询又选中同一账号。
 		acc := p.Store.Select(model.ProviderZai, tried, modelName)
-		if acc == nil || acc.Mode != "jwt" {
+		for acc != nil && acc.Mode != "jwt" {
+			tried[acc.ID] = true
+			acc = p.Store.Select(model.ProviderZai, tried, modelName)
+		}
+		if acc == nil {
 			p.emitError(ctx, ticketID, "无可用 OAuth 账号", "no_account")
 			return
 		}
@@ -313,7 +334,7 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 				announcedReady = true
 			}
 
-			midStream, streamErr := p.attemptUpstream(ctx, ticketID, acc, req, payload)
+			midStream, streamErr := p.attemptUpstream(ctx, ticketID, acc, modelName, req, payload)
 			if midStream {
 				// 已向客户端发出内容块，不能换号重发（会收到重复事件），终止本票
 				web.Warn(ticketID, fmt.Sprintf("流转发中断: %s", streamErr.Error()))
@@ -389,6 +410,7 @@ func (p *Pool) attemptUpstream(
 	ctx context.Context,
 	ticketID string,
 	acc *model.Account,
+	modelName string,
 	req upstream.Request,
 	payload []byte,
 ) (bool, error) {
@@ -400,7 +422,7 @@ func (p *Pool) attemptUpstream(
 		httpReq.Header.Set(k, v)
 	}
 
-	resp, err := p.client().Do(httpReq)
+	resp, err := p.clientFor(acc).Do(httpReq)
 	if err != nil {
 		return false, err
 	}
@@ -413,24 +435,60 @@ func (p *Pool) attemptUpstream(
 		}
 		bodyText := string(text)
 
+		// 分类顺序与 engine.handleUpstreamError 一致（PLAN §5.2），
+		// 同一账号在两条路径下必须标出相同状态。
 		if gateway.IsCaptchaError(bodyText, resp.StatusCode, resp.Header) {
 			// 验证码被拒：令牌作废，由调用方在内层循环内换令牌重试
 			p.Captcha.Invalidate()
 			return false, errCaptchaRejected
 		}
 
-		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable {
-			acc.FailCount++
-			until := float64(time.Now().Add(time.Duration(config.CoolingSeconds) * time.Second).UnixNano()) / 1e9
-			acc.Status = model.StatusCooling
-			acc.CoolingUntil = &until
-			msg := fmt.Sprintf("上游服務暫時不可用 HTTP %d", resp.StatusCode)
-			acc.LastError = &msg
-			_ = p.Store.UpdateAccount(acc)
+		// 401/403 → 账号失效，换号
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			gateway.MarkAccount(p.Store, acc.Provider, acc.ID, model.StatusInvalid,
+				fmt.Sprintf("鉴权失败 HTTP %d", resp.StatusCode), time.Now())
+			web.Warn(ticketID, fmt.Sprintf("账号 %s 鉴权失败 %d，切换下一个", acc.Name, resp.StatusCode))
+			return false, errNetwork{bodyText}
+		}
+
+		// 402 → 该模型额度用完
+		if resp.StatusCode == http.StatusPaymentRequired {
+			gateway.MarkModelExhausted(p.Store, acc.Provider, acc.ID, modelName,
+				fmt.Sprintf("%s 額度已用完", orCurrent(modelName)))
+			web.Warn(ticketID, fmt.Sprintf("账号 %s 的 %s 額度用完，切換下一個", acc.Name, orCurrent(modelName)))
+			return false, errNetwork{bodyText}
+		}
+
+		// 429 且 code=3010：模型并发准入限制，账号仍可用，不标状态
+		if gateway.IsModelConcurrencyLimit(resp.StatusCode, bodyText) {
+			web.Warn(ticketID, fmt.Sprintf("账号 %s 模型并发准入受限，保留账号状态", acc.Name))
+			return false, errNetwork{bodyText}
+		}
+
+		// 429：额度上限码族 → 该模型耗尽；其余瞬时限流 → 冷却
+		if resp.StatusCode == http.StatusTooManyRequests {
+			if gateway.IsQuotaExhaustedCode(bodyText) {
+				gateway.MarkModelExhausted(p.Store, acc.Provider, acc.ID, modelName,
+					fmt.Sprintf("%s 額度/用量上限已達", orCurrent(modelName)))
+				web.Warn(ticketID, fmt.Sprintf("账号 %s 的 %s 觸發用量上限，切換下一個", acc.Name, orCurrent(modelName)))
+			} else {
+				gateway.MarkAccount(p.Store, acc.Provider, acc.ID, model.StatusCooling, "上游限流 HTTP 429", time.Now())
+				web.Warn(ticketID, fmt.Sprintf("账号 %s 被限流 429，切换下一个", acc.Name))
+			}
+			return false, errNetwork{bodyText}
+		}
+
+		// 503 → 冷却换号
+		if resp.StatusCode == http.StatusServiceUnavailable {
+			p.bumpFail(acc)
+			gateway.MarkAccount(p.Store, acc.Provider, acc.ID, model.StatusCooling,
+				"上游服務不可用 HTTP 503", time.Now())
+			web.Warn(ticketID, fmt.Sprintf("账号 %s 上游返回 503，進入冷卻並切換下一個", acc.Name))
 			return false, errNetwork{bodyText}
 		}
 
 		// 其余错误：原样回传上游错误体，终止本票
+		p.bumpFail(acc)
 		p.emit(ctx, ticketID, ticketEvent{
 			Type: "error",
 			Data: map[string]any{"error": map[string]any{"message": bodyText, "type": "upstream_error"}},
@@ -438,12 +496,83 @@ func (p *Pool) attemptUpstream(
 		return false, errDelivered
 	}
 
+	// 200 且为 JSON：ZCode 的业务错误有时仍用 HTTP 200，不能当成成功串流。
+	// 分类与 engine.handleUpstreamJSON 对齐——同一响应在两条路径下必须
+	// 标出相同的账号状态，否则 async 请求会把额度耗尽的账号一直留在池里。
+	if strings.Contains(resp.Header.Get("Content-Type"), "application/json") {
+		buffered, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			return false, readErr
+		}
+		return p.handleUpstreamJSON(ctx, ticketID, acc, modelName, buffered)
+	}
+
 	// 200：转发 SSE；转发开始后中断按 chunk 计数区分两种出路
 	return p.forwardSSE(ctx, ticketID, resp, acc)
 }
 
+// handleUpstreamJSON 处理 HTTP 200 且 content-type 为 JSON 的响应。
+// 返回值语义与 attemptUpstream 一致（midStream / err）。
+func (p *Pool) handleUpstreamJSON(
+	ctx context.Context,
+	ticketID string,
+	acc *model.Account,
+	modelName string,
+	buffered []byte,
+) (bool, error) {
+	text := string(buffered)
+	code := gateway.UpstreamBusinessCode(text)
+
+	switch {
+	case code == "1005":
+		// 每日额度用完：该模型从池中摘除，换号重试
+		gateway.MarkModelExhausted(p.Store, acc.Provider, acc.ID, modelName,
+			fmt.Sprintf("%s 每日額度已用完", orCurrent(modelName)))
+		web.Warn(ticketID, fmt.Sprintf("账号 %s 的 %s 每日額度用完，切換下一個", acc.Name, orCurrent(modelName)))
+		return false, errNetwork{text}
+
+	case code == "3007":
+		// 验证码被拒：令牌作废，由调用方在内层循环内换令牌重试
+		p.Captcha.Invalidate()
+		return false, errCaptchaRejected
+
+	case code != "" && code != "0":
+		p.bumpFail(acc)
+		web.Warn(ticketID, fmt.Sprintf("上游業務錯誤 code=%s（账号 %s）", code, acc.Name))
+		p.emit(ctx, ticketID, ticketEvent{
+			Type: "error",
+			Data: map[string]any{"error": map[string]any{
+				"message": gateway.MessageFromJSON(text, buffered),
+				"type":    "upstream_error",
+				"code":    code,
+			}},
+		})
+		return false, errDelivered
+	}
+
+	// 业务码缺失 / 0：JSON 成功响应（async 期望 SSE，但上游给了普通 JSON）
+	p.bumpFail(acc)
+	web.Warn(ticketID, fmt.Sprintf("上游未返回 SSE 串流（账号 %s）", acc.Name))
+	p.emit(ctx, ticketID, ticketEvent{
+		Type: "error",
+		Data: map[string]any{"error": map[string]any{
+			"message": "上游未返回有效的 SSE 串流",
+			"type":    "invalid_upstream_response",
+		}},
+	})
+	return false, errDelivered
+}
+
 // errCaptchaRejected 上游拒绝验证码：调用方在内层循环内换令牌重试（不换号）。
 var errCaptchaRejected = errors.New("上游拒绝验证码")
+
+// orCurrent 模型名为空时的占位文案（与 gateway 同语义）。
+func orCurrent(modelName string) string {
+	if modelName == "" {
+		return "當前模型"
+	}
+	return modelName
+}
 
 // errDelivered 非 200 错误体已作为 error 事件投递给客户端，任务直接结束。
 var errDelivered = errors.New("已投递错误事件")
@@ -487,29 +616,55 @@ func (p *Pool) forwardSSE(ctx context.Context, ticketID string, resp *http.Respo
 		return false, err
 	}
 
-	// 统计落库失败不应触发换号重发
+	// 统计落库失败不应触发换号重发。
+	// 除 token 外还要记调用次数/最后使用时间并复位状态——与 engine.success
+	// 一致（gateway.MarkSuccess），否则后台用量页漏算 async 流量，
+	// 且冷却到期的账号即使这里已成功也仍停在 cooling。
 	usage.Finish()
-	acc.AccumulateTokens(usage.AsDict())
-	if err := p.Store.UpdateAccount(acc); err != nil {
-		web.Warn("async", "用量统计落库失败: "+err.Error())
-	}
+	got := usage.AsDict()
+	p.Store.Update(acc.Provider, acc.ID, func(a *model.Account) {
+		a.AccumulateTokens(got)
+	})
+	gateway.MarkSuccess(p.Store, acc.Provider, acc.ID, time.Now())
 	p.emit(ctx, ticketID, ticketEvent{Type: "done"})
 	return false, nil
 }
 
+// bumpFail 累加账号失败计数（锁内修改，供 503 与未知错误分支复用）。
+func (p *Pool) bumpFail(acc *model.Account) {
+	p.Store.Update(acc.Provider, acc.ID, func(a *model.Account) {
+		a.FailCount++
+	})
+}
+
 // ── 小工具 ──────────────────────────────────────────────────────────────────
 
-func (p *Pool) client() *http.Client {
+// asyncResponseHeaderTimeout 对齐 Python make_async_client(account, timeout=httpx.Timeout(180))：
+// 各阶段上限 180s；响应体流式读取（SSE）不能设总超时。
+const asyncResponseHeaderTimeout = 180 * time.Second
+
+// clientFor 返回账号的出站客户端。
+//
+// 与网关一致：账号配置了 proxy_url 时走对应代理。README 与 PLAN §5.9 都承诺
+// 「该账号的网关请求、额度查询与套餐领取均走对应代理」——async 曾漏掉这一条，
+// 配置代理的账号在这条路径上以服务器真实 IP 直连上游（泄露部署 IP、触发风控）。
+// 代理无效时回退直连并记日志，与 engine.clientFor / quota.clientFor 同语义。
+func (p *Pool) clientFor(acc *model.Account) *http.Client {
 	if p.Client != nil {
 		return p.Client
 	}
-	// 对齐 Python make_async_client(account, timeout=httpx.Timeout(180))：
-	// 各阶段上限 180s；响应体流式读取（SSE）不能设总超时
-	return &http.Client{
-		Transport: &http.Transport{
-			ResponseHeaderTimeout: 180 * time.Second,
-		},
+	raw := ""
+	if acc != nil && acc.ProxyURL != nil {
+		raw = *acc.ProxyURL
 	}
+	t, err := proxy.TransportForTimeout(raw, asyncResponseHeaderTimeout)
+	if err != nil {
+		// 仅当账号配了非法代理才会失败；回退直连（TransportForTimeout 对空 URL
+		// 永不报错，故此处 t 一定非 nil）。
+		web.Warn("async", fmt.Sprintf("账号 %s 代理无效，回退直连: %v", acc.Name, err))
+		t, _ = proxy.TransportForTimeout("", asyncResponseHeaderTimeout)
+	}
+	return &http.Client{Transport: t}
 }
 
 // marshalJSON 与网关一致（Python json.dumps(ensure_ascii=False) 形态）：

@@ -1,6 +1,9 @@
 # zcode2api-plus 容器镜像：多阶段构建，单二进制 + 内嵌前端，无外部运行时。
 # 构建：docker build -t zcode2api-plus .
 # 运行：docker run -d -p 3000:3000 -v zcode-data:/data ghcr.io/janver/zcode2api-plus:latest
+#
+# 已由 GitHub Actions（.github/workflows/docker.yml）在 v* tag 时构建
+# linux/amd64 + linux/arm64 双架构镜像并推送 GHCR，本地构建亦可复现。
 
 # ── 构建阶段 ──────────────────────────────────────────
 FROM golang:1.25-bookworm AS builder
@@ -61,4 +64,5 @@ COPY --from=builder /out/zcode2api /usr/local/bin/zcode2api
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD wget -q -O /dev/null "http://127.0.0.1:${ZCODE_PORT:-3000}/meta" || exit 1
 
-ENTRYPOINT ["zcode2api", "serve"]
+ENTRYPOINT ["zcode2api"]
+CMD ["serve"]

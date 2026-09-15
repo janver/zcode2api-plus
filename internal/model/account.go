@@ -64,20 +64,20 @@ type Account struct {
 	Plans           []map[string]any          `json:"plans"` // 账号下全部订阅方案
 	Usage           map[string]any            `json:"usage"` // 近期用量原始数据
 
-	UseCount              int      `json:"use_count"`
-	FailCount             int      `json:"fail_count"`
-	TotalInputTokens      int      `json:"total_input_tokens"`
-	TotalOutputTokens     int      `json:"total_output_tokens"`
+	UseCount                 int      `json:"use_count"`
+	FailCount                int      `json:"fail_count"`
+	TotalInputTokens         int      `json:"total_input_tokens"`
+	TotalOutputTokens        int      `json:"total_output_tokens"`
 	TotalCacheCreationTokens int      `json:"total_cache_creation_tokens"`
-	TotalCacheReadTokens  int      `json:"total_cache_read_tokens"`
-	LastUsedAt            *float64 `json:"last_used_at"`
-	LastCheckedAt         *float64 `json:"last_checked_at"`
-	CoolingUntil          *float64 `json:"cooling_until"`
-	LastError             *string  `json:"last_error"`
-	ProxyURL              *string  `json:"proxy_url"`
-	ProxyID               *string  `json:"proxy_id"`
-	CreatedAt             float64  `json:"created_at"`
-	ArchivedAt            *float64 `json:"archived_at"` // 非空表示已归档：只保留记录，不参与调度/领取/刷新
+	TotalCacheReadTokens     int      `json:"total_cache_read_tokens"`
+	LastUsedAt               *float64 `json:"last_used_at"`
+	LastCheckedAt            *float64 `json:"last_checked_at"`
+	CoolingUntil             *float64 `json:"cooling_until"`
+	LastError                *string  `json:"last_error"`
+	ProxyURL                 *string  `json:"proxy_url"`
+	ProxyID                  *string  `json:"proxy_id"`
+	CreatedAt                float64  `json:"created_at"`
+	ArchivedAt               *float64 `json:"archived_at"` // 非空表示已归档：只保留记录，不参与调度/领取/刷新
 }
 
 // Create 对应 Python 版 Account.create：按凭证形态判定 jwt/apiKey 模式。
@@ -148,6 +148,105 @@ func (a *Account) Secret() string {
 		return derefString(a.JWTToken)
 	}
 	return derefString(a.APIKey)
+}
+
+// Clone 深拷贝账号（含 map/slice 与指针字段）。
+//
+// 用途：Store 在持锁状态下把账号副本交给并发路径读取，
+// 避免调用方在锁外直接触碰 Store 内部对象（曾因此产生数据竞争）。
+// 值语义字段直接复制；容器与指针逐层重建，不与原对象共享底层数组。
+func (a *Account) Clone() *Account {
+	if a == nil {
+		return nil
+	}
+	c := *a
+	c.Email = clonePtr(a.Email)
+	c.JWTToken = clonePtr(a.JWTToken)
+	c.APIKey = clonePtr(a.APIKey)
+	c.LastUsedAt = clonePtr(a.LastUsedAt)
+	c.LastCheckedAt = clonePtr(a.LastCheckedAt)
+	c.CoolingUntil = clonePtr(a.CoolingUntil)
+	c.LastError = clonePtr(a.LastError)
+	c.ProxyURL = clonePtr(a.ProxyURL)
+	c.ProxyID = clonePtr(a.ProxyID)
+	c.ArchivedAt = clonePtr(a.ArchivedAt)
+	c.ExhaustedModels = CloneStrings(a.ExhaustedModels)
+	c.DisabledModels = CloneStrings(a.DisabledModels)
+	c.Quota = cloneQuota(a.Quota)
+	c.Plan = cloneAnyMap(a.Plan)
+	c.Plans = cloneAnyMapSlice(a.Plans)
+	c.Usage = cloneAnyMap(a.Usage)
+	return &c
+}
+
+func clonePtr[T any](p *T) *T {
+	if p == nil {
+		return nil
+	}
+	v := *p
+	return &v
+}
+
+// CloneStrings 复制字符串切片并保持 nil/非 nil 语义。
+// 不能用 append([]string(nil), src...)——src 为非 nil 空切片时它会返回 nil，
+// 而 JSON 契约要求这类容器字段序列化成 [] 而不是 null。
+func CloneStrings(in []string) []string {
+	if in == nil {
+		return nil
+	}
+	out := make([]string, len(in))
+	copy(out, in)
+	return out
+}
+
+func cloneQuota(in map[string]map[string]any) map[string]map[string]any {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]map[string]any, len(in))
+	for k, v := range in {
+		out[k] = cloneAnyMap(v)
+	}
+	return out
+}
+
+func cloneAnyMap(in map[string]any) map[string]any {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]any, len(in))
+	for k, v := range in {
+		out[k] = cloneAnyValue(v)
+	}
+	return out
+}
+
+func cloneAnyMapSlice(in []map[string]any) []map[string]any {
+	if in == nil {
+		return nil
+	}
+	out := make([]map[string]any, len(in))
+	for i, m := range in {
+		out[i] = cloneAnyMap(m)
+	}
+	return out
+}
+
+// cloneAnyValue 递归复制 JSON 解码得到的容器值（map/slice）；
+// 标量（string/float64/bool/nil）直接返回。
+func cloneAnyValue(v any) any {
+	switch t := v.(type) {
+	case map[string]any:
+		return cloneAnyMap(t)
+	case []any:
+		out := make([]any, len(t))
+		for i, e := range t {
+			out[i] = cloneAnyValue(e)
+		}
+		return out
+	default:
+		return v
+	}
 }
 
 // IsSelectable 是否可被轮询选中（对齐 Account.is_selectable）。

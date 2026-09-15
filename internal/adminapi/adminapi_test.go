@@ -217,6 +217,28 @@ func TestEditAccountLifecycle(t *testing.T) {
 		t.Fatalf("字段应更新: mode=%s name=%s", acc.Mode, acc.Name)
 	}
 
+	// 设置代理后必须能再清空：proxy_url 传空串表示「改回直连」。
+	// 这与「字段未提供」是两种语义——若实现只看归一化结果是否为 nil，
+	// 清空会静默失效（响应 ok 但代理仍在）。
+	code, _ = do(t, mux, st, http.MethodPut, "/admin/api/accounts/"+accountID, map[string]any{
+		"proxy_url": "http://127.0.0.1:1080",
+	})
+	if code != http.StatusOK {
+		t.Fatalf("设置代理应成功: %d", code)
+	}
+	if got := st.FindAny(accountID); got.ProxyURL == nil || *got.ProxyURL != "http://127.0.0.1:1080" {
+		t.Fatalf("代理应已设置: %v", got.ProxyURL)
+	}
+	code, _ = do(t, mux, st, http.MethodPut, "/admin/api/accounts/"+accountID, map[string]any{
+		"proxy_url": "",
+	})
+	if code != http.StatusOK {
+		t.Fatalf("清空代理应成功: %d", code)
+	}
+	if got := st.FindAny(accountID); got.ProxyURL != nil {
+		t.Fatalf("代理应已清空: %v", *got.ProxyURL)
+	}
+
 	// 禁用
 	code, body = do(t, mux, st, http.MethodPost, "/admin/api/accounts/"+accountID+"/enabled",
 		map[string]any{"enabled": false})
@@ -518,10 +540,9 @@ func TestMonitorAndUsage(t *testing.T) {
 
 	// 预置用量与状态供快照/排行断言
 	acc := st.FindAny(str(t, ids[0]))
-	acc.UseCount, acc.FailCount, acc.TotalInputTokens, acc.TotalOutputTokens = 8, 2, 100, 40
-	if err := st.UpdateAccount(acc); err != nil {
-		t.Fatal(err)
-	}
+	st.Update(acc.Provider, acc.ID, func(a *model.Account) {
+		a.UseCount, a.FailCount, a.TotalInputTokens, a.TotalOutputTokens = 8, 2, 100, 40
+	})
 
 	code, body := do(t, mux, st, http.MethodGet, "/admin/api/monitor", nil)
 	if code != http.StatusOK {

@@ -119,8 +119,9 @@ func (h *Handler) handleAddAccounts(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		} else if hasProxy {
-			acc.ProxyURL = proxyURL
-			if err := h.Store.UpdateAccount(acc); err != nil {
+			if err := h.Store.Update(acc.Provider, acc.ID, func(a *model.Account) {
+				a.ProxyURL = proxyURL
+			}); err != nil {
 				writeError500(w, err)
 				return
 			}
@@ -228,33 +229,50 @@ func (h *Handler) handleEditAccount(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, errBadRequest("代理配置不存在"))
 		return
 	}
+
+	// 在快照上完成校验与组装，只记录「本次要改哪些字段」；
+	// 落库时在 Store 锁内重新取当前对象，逐字段套用。
+	// 不能整体覆盖：快照可能已陈旧（并发请求刚把账号标成 invalid/cooling），
+	// 整体写回会把这些状态改动冲掉。
+	var (
+		setName           *string
+		setSecret         *model.Account // 仅借其 Mode/JWTToken/APIKey 三字段
+		setProxy          bool           // proxy_url 字段是否出现（值可为 nil = 清空）
+		proxyURL          *string
+		clearProxyID      bool
+		setDisabledModels []string
+	)
 	if v, ok := payload["name"]; ok && truthy(v) {
-		acc.Name = strings.TrimSpace(strOf(v))
+		name := strings.TrimSpace(strOf(v))
+		setName = &name
 	}
 	if secret := firstTruthy(payload["token"], payload["secret"]); truthy(secret) {
 		s := strings.TrimSpace(strOf(secret))
+		cred := &model.Account{}
 		if strings.Count(s, ".") == 2 && acc.Provider == model.ProviderZai {
-			acc.Mode = "jwt"
-			acc.JWTToken = &s
-			acc.APIKey = nil
+			cred.Mode = "jwt"
+			cred.JWTToken = &s
 		} else {
-			acc.Mode = "apiKey"
-			acc.APIKey = &s
-			acc.JWTToken = nil
+			cred.Mode = "apiKey"
+			cred.APIKey = &s
 		}
-		acc.Status = model.StatusActive
-		acc.LastError = nil
+		setSecret = cred
 	}
 	if v, ok := payload["proxy_url"]; ok && !hasProfile {
-		proxyURL, err := proxy.NormalizeProxyURL(strOf(v))
+		// 用 = 而非 := 赋值到外层 proxyURL：:= 会新建内层变量，
+		// 闭包捕获的仍是外层那个，写入就变成了空操作。
+		var err error
+		proxyURL, err = proxy.NormalizeProxyURL(strOf(v))
 		if err != nil {
 			writeAPIError(w, errBadRequest(err.Error()))
 			return
 		}
 		if !sameStringPtr(proxyURL, acc.ProxyURL) {
-			acc.ProxyID = nil // 改为手工代理时解除线路指派
+			clearProxyID = true // 改为手工代理时解除线路指派
 		}
-		acc.ProxyURL = proxyURL
+		// NormalizeProxyURL("") 返回 nil 表示「清空代理」，与「字段未提供」
+		// 是两种语义，必须用 setProxy 区分，不能只看值是否为 nil。
+		setProxy = true
 	}
 	if v, ok := payload["disabled_models"]; ok {
 		models, apiErr := parseDisabledModels(v)
@@ -262,17 +280,42 @@ func (h *Handler) handleEditAccount(w http.ResponseWriter, r *http.Request) {
 			writeAPIError(w, apiErr)
 			return
 		}
-		acc.SetDisabledModels(models)
+		setDisabledModels = models
 	}
-	if err := h.Store.UpdateAccount(acc); err != nil {
-		writeError500(w, err)
-		return
-	}
+
+	// 先指派线路再套用其他字段：AssignProxyProfile 自带锁，不能放进 Update
+	// 闭包（会死锁），而它可能因 profile 已被并发删除而失败。放在前面，失败时
+	// 其余字段尚未落库，避免「回 500 但 name/secret 已生效」的半套用。
 	if hasProfile {
 		if _, err := h.Store.AssignProxyProfile(acc.ID, profileID); err != nil {
 			writeError500(w, err)
 			return
 		}
+	}
+
+	if err := h.Store.Update(acc.Provider, acc.ID, func(a *model.Account) {
+		if setName != nil {
+			a.Name = *setName
+		}
+		if setSecret != nil {
+			a.Mode = setSecret.Mode
+			a.JWTToken = setSecret.JWTToken
+			a.APIKey = setSecret.APIKey
+			a.Status = model.StatusActive
+			a.LastError = nil
+		}
+		if setProxy {
+			a.ProxyURL = proxyURL
+			if clearProxyID {
+				a.ProxyID = nil
+			}
+		}
+		if setDisabledModels != nil {
+			a.SetDisabledModels(setDisabledModels)
+		}
+	}); err != nil {
+		writeError500(w, err)
+		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
@@ -364,10 +407,13 @@ func (h *Handler) handleRefreshAll(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// 与后台周期监控同一套筛选（quota.Monitor）：跳过已归档与已停用账号。
+	// store.SetArchived 的契约是「调度、领取、刷新全部跳过」，而刷新还会经
+	// handleBillingResponse 把归档账号的状态写回 active，与归档语义冲突。
 	var targets []*model.Account
 	if truthy(payload["all"]) {
 		for _, a := range h.Store.ListAccounts(model.ProviderZai) {
-			if a.Mode == "jwt" {
+			if a.Mode == "jwt" && a.ArchivedAt == nil && a.Status != model.StatusDisabled {
 				targets = append(targets, a)
 			}
 		}
@@ -381,7 +427,7 @@ func (h *Handler) handleRefreshAll(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		for _, a := range h.Store.ListAccounts("") {
-			if ids[a.ID] && a.Mode == "jwt" {
+			if ids[a.ID] && a.Mode == "jwt" && a.ArchivedAt == nil && a.Status != model.StatusDisabled {
 				targets = append(targets, a)
 			}
 		}
@@ -396,6 +442,15 @@ func (h *Handler) handleRefreshAccount(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, errNotFound("账号不存在"))
 		return
 	}
+	// 归档账号不参与刷新（与周期监控、批量刷新一致）：刷新会把它写回 active，
+	// 与「归档即停止调用」的语义冲突。
+	if acc.ArchivedAt != nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":      false,
+			"message": "账号已归档，不参与额度刷新",
+		})
+		return
+	}
 	if acc.Mode != "jwt" {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ok":      false,
@@ -404,6 +459,7 @@ func (h *Handler) handleRefreshAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	res := h.Quota.FetchQuota(acc)
+	// FetchQuota 在锁内落库，这里重新取快照以反映最新状态
 	updated := h.Store.FindAny(r.PathValue("account_id"))
 	if updated == nil {
 		updated = acc
@@ -422,8 +478,9 @@ func (h *Handler) handleResetStats(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, errNotFound("账号不存在"))
 		return
 	}
-	acc.ResetTokenStats()
-	if err := h.Store.UpdateAccount(acc); err != nil {
+	if err := h.Store.Update(acc.Provider, acc.ID, func(a *model.Account) {
+		a.ResetTokenStats()
+	}); err != nil {
 		writeError500(w, err)
 		return
 	}

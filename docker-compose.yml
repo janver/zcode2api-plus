@@ -1,3 +1,11 @@
+# zcode2api-plus Docker Compose 部署：直接使用 GHCR 发布镜像（双架构已验证）。
+# 首次部署：在 .env 设置 ZCODE_ADMIN_KEY / ZCODE_GATEWAY_KEY 后
+#   docker compose pull && docker compose up -d
+#
+# 数据卷为 bind mount：容器以非 root 用户 appuser（uid 10001）运行，
+# 宿主机目录必须先授权，否则启动报 unable to open database file (14)：
+#   sudo chown -R 10001:10001 ./zcode-data ./zcode-browser
+
 services:
   zcode2api:
     image: ghcr.io/janver/zcode2api-plus:latest
