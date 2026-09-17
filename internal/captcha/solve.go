@@ -30,6 +30,7 @@ import (
 	"github.com/go-rod/rod/lib/proto"
 
 	"zcode2api/internal/config"
+	"zcode2api/internal/web"
 )
 
 //go:embed AliyunCaptcha.js.txt
@@ -211,6 +212,13 @@ type RodWorker struct {
 	browser  *rod.Browser
 	page     *rod.Page
 
+	// browserCancel 取消绑定在 browser 上的 ctx。
+	// rod 的 Browser 默认用 context.Background()，其 CDP 调用（classify 的
+	// GetVersion 探针、Page 创建、Browser.Close）在浏览器假死时会永久阻塞——
+	// 这里运行在池的槽位 goroutine 上，卡住即槽位永不归队（workers 默认 1
+	// 时整池失效）。Close 时取消，让这些调用立即返回。
+	browserCancel context.CancelFunc
+
 	cfg          Config
 	solveTimeout time.Duration // 单次求解超时（对齐 --solve-timeout 默认 40s）
 	sdkLoadTTL   time.Duration // SDK 加载超时（对齐 --sdk-load-timeout 默认 20s）
@@ -223,7 +231,7 @@ type RodWorker struct {
 // NewRodWorkerFactory 构造绑定验证码配置的真实求解工厂。
 func NewRodWorkerFactory(cfg Config) WorkerFactory {
 	return func(ctx context.Context) (Worker, error) {
-		bin, err := DiscoverBrowserBinary()
+		bin, err := DiscoverBrowserBinary(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -241,23 +249,34 @@ func newRodWorker(ctx context.Context, bin string, cfg Config) (*RodWorker, erro
 	// NoDefaultDevice：rod 默认设备模拟（LaptopWithMDPI）会用 CDP 改写 UA 与视口，
 	// 覆盖补丁二进制的指纹输出，必须关闭（playwright 侧无设备模拟）。
 	if err := b.Connect(); err != nil {
-		_ = b.Close()
-		l.Cleanup()
+		// Connect 失败时 rod 的 client 仍是 nil（Browser.Connect 只在
+		// cdp.StartWithURL 成功后赋值），此时 Browser.Close 会走
+		// b.client.Call(...) 对 nil interface 调用方法 —— 直接 panic，
+		// 而这里运行在池的槽位 goroutine 上，一次浏览器启动异常就会
+		// 终止整个网关进程。只做进程侧清理。
+		closeLauncher(l)
 		return nil, fmt.Errorf("浏览器连接失败: %w", err)
 	}
 	page, err := loadSDKPage(ctx, b, cfg)
 	if err != nil {
 		_ = b.Close()
-		l.Cleanup()
+		closeLauncher(l)
 		return nil, fmt.Errorf("页面初始化失败: %w", err)
 	}
+	// 绑定一个可取消的 ctx 到 browser：Browser.Context 返回克隆，故必须
+	// 在此处替换，之后 w.browser 的所有 CDP 调用都受它约束。
+	browserCtx, browserCancel := context.WithCancel(context.Background())
+	b = b.Context(browserCtx)
+	page = page.Context(browserCtx)
+
 	return &RodWorker{
-		launcher:     l,
-		browser:      b,
-		page:         page,
-		cfg:          cfg,
-		solveTimeout: time.Duration(config.CaptchaSolveTimeout) * time.Second,
-		sdkLoadTTL:   sdkLoadTimeout,
+		launcher:      l,
+		browser:       b,
+		page:          page,
+		browserCancel: browserCancel,
+		cfg:           cfg,
+		solveTimeout:  time.Duration(config.CaptchaSolveTimeout) * time.Second,
+		sdkLoadTTL:    sdkLoadTimeout,
 	}, nil
 }
 
@@ -370,7 +389,13 @@ func (w *RodWorker) reload(ctx context.Context) error {
 }
 
 // Close 释放浏览器与会话资源。
+//
+// 顺序：先取消 ctx 让所有在途/后续 CDP 调用立即失败返回（浏览器假死时
+// Close/Page 都会永久阻塞），再关页面与浏览器，最后有界地杀进程。
 func (w *RodWorker) Close() error {
+	if w.browserCancel != nil {
+		w.browserCancel()
+	}
 	if w.page != nil {
 		_ = w.page.Close()
 		w.page = nil
@@ -378,10 +403,35 @@ func (w *RodWorker) Close() error {
 	if w.browser != nil {
 		_ = w.browser.Close()
 	}
-	if w.launcher != nil {
-		w.launcher.Cleanup() // 移除临时 user-data-dir
-	}
+	closeLauncher(w.launcher) // 有界：杀进程 + 移除临时 user-data-dir
 	return nil
+}
+
+// launcherCleanupTimeout 关闭启动器时的等待上限。
+//
+// rod 的 Launcher.Cleanup 是 `<-l.exit`（等浏览器进程退出），没有任何上限；
+// 浏览器假死或启动后既不打印 DevTools URL 也不退出时，它会永久阻塞——而这里
+// 运行在池的槽位 goroutine 上，卡住即等于该槽位永不归队（workers 默认 1 时
+// 整个池失效）。改为先杀进程、再有界等待。
+const launcherCleanupTimeout = 5 * time.Second
+
+// closeLauncher 有界地关闭启动器：杀掉浏览器进程，最多等 launcherCleanupTimeout
+// 让 rod 完成自身的退出处理与 user-data-dir 清理，超时则直接返回。
+func closeLauncher(l *launcher.Launcher) {
+	if l == nil {
+		return
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		l.Kill()
+		l.Cleanup()
+	}()
+	select {
+	case <-done:
+	case <-time.After(launcherCleanupTimeout):
+		web.Warn("captcha", "浏览器进程未在超时内退出，已放弃等待")
+	}
 }
 
 // sleepCtx 可中断睡眠。
@@ -402,7 +452,7 @@ func sleepCtx(ctx context.Context, d time.Duration) {
 //  3. CLOAKBROWSER_CACHE_DIR（默认 ~/.cloakbrowser）下 chromium-<版本>[<suffix>]
 //     目录，取版本号最高者。可执行文件名按平台：Linux chrome、Windows chrome.exe、
 //     macOS Chromium.app 包（对齐 cloakbrowser get_binary_path）。
-func DiscoverBrowserBinary() (string, error) {
+func DiscoverBrowserBinary(ctx context.Context) (string, error) {
 	if bin := strings.TrimSpace(config.CaptchaBrowserBin); bin != "" {
 		if info, err := os.Stat(bin); err == nil && !info.IsDir() {
 			return bin, nil
@@ -428,7 +478,7 @@ func DiscoverBrowserBinary() (string, error) {
 	entries, err := os.ReadDir(cacheDir)
 	if err != nil {
 		// 缓存目录不可读（首次部署）：走自动下载，无需 Python 预下载。
-		return discoverViaDownload()
+		return discoverViaDownload(ctx)
 	}
 	type candidate struct {
 		version []int
@@ -451,7 +501,7 @@ func DiscoverBrowserBinary() (string, error) {
 		}
 	}
 	if len(candidates) == 0 {
-		return discoverViaDownload()
+		return discoverViaDownload(ctx)
 	}
 	// 版本降序，取最高
 	sort.Slice(candidates, func(i, j int) bool {
@@ -468,8 +518,12 @@ func DiscoverBrowserBinary() (string, error) {
 
 // discoverViaDownload 发现链落空后的兜底：自动下载补丁 Chromium 再重扫缓存目录。
 // 下载失败返回原始错误（人工回填兜底不受影响）。
-func discoverViaDownload() (string, error) {
-	version, err := EnsureBrowserBinary(context.Background())
+//
+// 传入 ctx 而非自建 Background：首次下载约 200MB，可能远超调用方的
+// CaptchaBrowserStartupTimeout；不自建 ctx 会让调用方放弃后下载仍在跑，
+// 槽位 goroutine 与 cm.Close() 都无法取消它。
+func discoverViaDownload(ctx context.Context) (string, error) {
+	version, err := EnsureBrowserBinary(ctx)
 	if err != nil {
 		return "", fmt.Errorf("自动下载补丁 Chromium 失败（可手动执行 python -m cloakbrowser install 或设 ZCODE_CAPTCHA_BROWSER_BIN）: %w", err)
 	}

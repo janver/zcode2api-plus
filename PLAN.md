@@ -2,8 +2,7 @@
 
 > 本仓库 `C:\Projects\zcode2api-plus`（分支 `go-rewrite`）即 Go 重写仓库（原 `go/`
 > 子目录已上提到仓库根，Python 版实验工作区内容已移除）。计划与行为契约参照
-> Python 版（原主仓库 `app/` + `main.py`，现归档于本仓库 `python-legacy` 分支）
-> 与 `HANDOFF.md`。
+> Python 版（原主仓库 `app/` + `main.py`，现归档于本仓库 `python-legacy` 分支）。
 > 目标：用 Go 重写 Python 版的全部后端功能，
 > 做到**与 Python 版行为对齐、数据互通（共用同一个 `data/accounts.db`）、前端零改动**。
 > 本文档是唯一的计划与进度台账，每完成一项就勾选对应 `- [ ]`。
@@ -37,8 +36,9 @@
 - [x] 验证码：真实 Chromium 池（rod）+ 人工回填兜底
 - [x] SQLite 持久化（accounts + meta，WAL）与 **Python 版数据库互通**
 - [x] CLI 子命令（serve / login / add-account / accounts / remove-account / quota / status / set-admin-key / export / import）
-- [x] Release CI（2026-09-11 定案：放弃 Docker 裸二进制交付；GitHub Actions 推 v* tag 构建五平台
-  linux/amd64、linux/arm64、darwin/amd64、darwin/arm64、windows/amd64 并上传 Releases）— `.github/workflows/release.yml`
+- [x] Release CI（2026-09-11 定案：放弃 Docker 裸二进制交付；GitHub Actions 推 v* tag 构建
+  linux/amd64、linux/arm64 并上传 Releases）— `.github/workflows/release.yml`
+  （仅维护 Linux 双架构：本項目面向服务端自部署，其余平台不发布）
 - [x] **Linux 一键部署**（仅 Linux）：`deploy/manage.sh` 单一交互式管理脚本
   （二进制的安装/更新/卸载/状态 + Docker 的安装/更新/卸载 + 服务控制，**已实测**）
   + systemd 单元模板。另有 `Dockerfile` + `docker-compose.yml` 作为参考实现，
@@ -130,9 +130,12 @@
     ├── proxy/                   # ← app/proxy.py（Transport 缓存 + socks4/4a/5/5h 拨号器）
     │   ├── proxy.go             # URL 归一化与 scheme 白名单
     │   └── client.go            # TransportFor / ClientFor / socks 握手
-    └── web/
-        ├── spa.go               # /admin catch-all + /assets 静态 + /meta
-        └── logs.go              # ← app/logs.py（彩色终端）
+    ├── web/
+    │   ├── spa.go               # /admin catch-all + /assets 静态 + /meta
+    │   └── logs.go              # ← app/logs.py（彩色终端）
+    ├── guest/guest.go           # 访客账号提交（/guest/*）：仅 OAuth + 实测通过才入池
+    └── util/util.go             # 跨包复用的无依赖工具（JSON/UUID/随机/截断/时间）
+                                 #   仅依赖标准库，故任何包都可安全引入（无环）
 ```
 
 Python 版 `app/zcode_system.json` 已复制为 `internal/upstream/zcode_system.json` 并 `embed`。
@@ -331,7 +334,7 @@ meta(key TEXT PK, value TEXT)
 - [x] OAuth 登录链（internal/oauth + adminapi login 端点 + CLI login）、账号代理出口
   （internal/proxy：http/https CONNECT + 手写 socks4/4a/5/5h，Transport 缓存；引擎与 quota 已接线）、
   CLI 子命令（serve/login/add-account/accounts/remove-account/quota/status/set-admin-key/export/import）、
-  Release CI（推 `v*` tag 交叉编译五平台并上传 Releases）
+  Release CI（推 `v*` tag 交叉编译 linux/amd64 与 linux/arm64 并上传 Releases）
 - [x] Linux 一键部署（`deploy/manage.sh` 单一交互式管理脚本，**已实测**）：
   二进制安装/更新（版本比对+回滚）/卸载/状态 + Docker 安装/更新/卸载 + 服务控制；
   systemd 单元模板内嵌于脚本，单文件可部署。另附 `Dockerfile` + `docker-compose.yml`
@@ -570,6 +573,117 @@ Previous read at ... by goroutine 11:
   而后台 API 对同一字段已有拒绝逻辑。
 - `login` 忽略 `Store.Update` 的落库错误仍报「已保存」。
 
+### M12 补审：`internal/captcha`（1,865 行，最大且最复杂）
+
+浏览器池 / 求解 / 自动下载三层的审查，对照 `go-rod/rod@v0.116.2` 与
+`ysmood/leakless@v0.9.0` 原始码逐条验证推论。
+
+**高（已修复，c1acdf7）**
+
+- **`Connect` 失败后对 nil client 调 `Close`，panic 终止整个进程** —
+  rod 的 `Browser.Connect` 只在 `cdp.StartWithURL` 成功后给 `client` 赋值，
+  失败时 `client` 仍为 nil；`Browser.Close` 直接走 `b.client.Call(...)`，
+  nil interface 方法调用即 panic。该路径运行在池的槽位 goroutine 上，套件内
+  无任何 `recover`——一次浏览器启动异常即服务全挂。已实测复现（连接死地址后
+  `Close` 报 `nil pointer dereference`）。修法：只做进程侧清理。
+  回归测试 `TestNewRodWorkerConnectFailureDoesNotPanic`（用「回应版本探测但拒绝
+  WebSocket 握手」的假浏览器落到该分支；还原旧清理逻辑即 panic）。
+- **rod 调用未绑定 ctx，槽位协程可永久卡死** — `rod.New()` 的 ctx 是
+  `context.Background()`，而 `cdp.Client.Call` 靠 `ctx.Done()` 取消，故
+  `classify` 的存活探针、`b.Page`、`browser.Close`、`launcher.Cleanup`
+  （`<-l.exit`）在浏览器假死时全部无界阻塞。池的逾时机制建立在「`Solve` 一定
+  返回」的前提上：卡住即槽位永不归队、永不替换，workers 默认 1 时整池永久失效。
+  修法：browser 绑定可取消 ctx（`Close` 时先取消），launcher 清理改为
+  「先杀进程 + 最多等 5s」。
+
+**中（已修复）**
+
+- **持锁执行 `pool.Start()`/`Stop()`** — `Start` 最长 90s、`Stop` 10s，期间所有
+  并发 `GetVerifyParam` 卡在同一把锁上，各自 ctx 取消完全无效。已拆为「锁内决策、
+  锁外启动」，并让并发者等待启动信号（可被 ctx 取消）；`Close` 先等启动结束再拆，
+  否则该池会在 `Close` 返回后才赋值、既漏关又泄漏浏览器进程。
+  回归测试 `TestBrowserSolverStartDoesNotHoldLock`。
+- **首次下载不受 startupTimeout 约束** — 用 `context.Background()` 且
+  `downloadMutex` 是普通 `sync.Mutex`。下载上限 10 分钟 vs 启动超时 90s，
+  调用方放弃后槽位仍被扣住、`cm.Close()` 也取消不掉。现 ctx 贯穿全链，
+  锁改为可取消的 channel。回归测试 `TestEnsureVersionDownloadLockIsCancellable`。
+- **解包硬链接 `Linkname` 未做逃逸校验** — 同函数的 `Name` 与 `TypeSymlink`
+  分支都有校验，唯 `TypeLink` 只 `filepath.Clean`，`../../..` 可读到宿主任意文件
+  并写进安装目录。签名链阻断当前利用，属纵深缺口。回归测试
+  `TestExtractTarGzRejectsEscapingHardlink`（断言拒绝理由是路径校验，而非
+  「源文件恰好读不到」——后者在源存在时会放行）。
+
+**低（已修复）**
+
+- 解包前用 `string(archive)` 复制整包，峰值内存约 2× 压缩包（200MB 包 → 400MB）；
+  改用 `bytes.NewReader` 零复制。
+- `BrowserSolver` 的配置校验只拒「三项全空」，与错误文案「缺少任一」不符；
+  缺一项仍会拉起浏览器并加载 224KB SDK 才失败。
+- `ZCODE_CAPTCHA_TIMEOUT` 是唯一未做下界钳制的 captcha 旋钮（0/负值使 deadline
+  立即过期且不触发冷却，极大值在 `time.Duration` 乘法处溢出成负值）。
+
+**已检查确认无缺陷**：池的并发/关闭语义（generation 隔离、teardown 三段式、
+`closeOnce` 幂等、双重 `Stop`、逾时判死替换、`condemned`/`abandoned` 防误投）、
+求解失败路径（`pageDirty` 四条路径全覆盖、失败冷却只在启动失败时设定）、
+下载校验链（Ed25519 验签不降级 + SHA256 比对在解包前 + 原子安装）、
+路径穿越（tar 的 `Name` 与 symlink、zip 的 `Name`）、
+`GetVerifyParam` 的 `(nil, nil)` 语义与三个调用方的契约、rod/leakless 进程兜底。
+
+### M13 代码整理：收敛重复实现（2026-09-16）
+
+各包此前各自抄了一份相同的辅助函数，仓库里有 4 份 `marshalJSON`、3 份 `newUUID`、
+3 份 `randomHex`、2 份 `randomTokenURLSafe`、2 份 `truncate`、2 份 `orDefault`、
+2 份 `orCurrent`、2 份 `anyToString`。这些副本逐字相同——正是最危险的情形：
+只要有人改动其中一份而漏掉另一份，同一份数据就会在不同路径上被序列化成不同形态。
+
+新增 `internal/util` 收录它们（只依赖标准库，任何包引入都不会成环）。同时：
+- 删除死码 `openai.errStr`（零调用者）与 `gateway.startPlanBusyRetryDelays`
+  （声明后从未被读，`NewEngine` 内联了同一字面量；现改为引用该变量）。
+- OpenAI 的两对交付函数（`deliverJSON`/`deliverResponsesJSON`、
+  `deliverStream`/`deliverResponsesStream`）逐行相同，仅转换器不同，已参数化。
+- `stream.go` 与 `responses_stream.go` 的 SSE 框架循环逐字相同，抽出 `scanSSE`。
+- `asyncpool.writeJSONStatus` 与 `gateway.WriteJSON` 逐字相同、鉴权错误内联与
+  `gateway.WriteAuthError` 等价，均已复用。
+
+**刻意保持独立**（重复编码了真实差异，合并会改变行为）：
+- `clientFor` 四份：超时与回退策略按调用链选择（网关 120s 响应头、async 180s
+  响应头、quota 20s 总超时、claim 25s 总超时）。
+- `strOf` 两份：adminapi 版实现 Python 的 `str(v or "")`（依赖 `truthy` 做空值链），
+  model 版是纯值格式化；反向覆盖会让后台 API 的 nil 变成 `"<nil>"`。
+- `toInt` 两份：claim 版以 `-1` 表示业务码解析失败，usage 版以 `0` 表示无用量。
+- engine 与 asyncpool 的错误分类链：出路型别（`attemptResult` vs `(midStream, error)`）
+  与重试策略不同，仅判定函数与文案已共用。
+
+净减约 230 行；`go test ./...` 与 `-race` 全绿。
+
+### M14 访客账号提交（2026-09-16）
+
+新增 `/guest` 公开入口，让访客提交自己的 Z.AI 账号。三条约束塑造了整个设计：
+
+1. **只走 OAuth，不提供令牌输入框** — 完成授权能证明提交者确实持有该账号；
+   贴上一串 JWT 什么也证明不了，开放输入框等于让任何人往池里塞不属于自己的串。
+2. **实测通过才入池** — 授权只说明「现在持有」，不说明「当下可用」（可能已封禁、
+   额度耗尽、地区受限）。账号先在内存构造，经 `Engine.TestAccount` 发一次最小的
+   真实请求（`max_tokens=1`），成功才写 Store。
+   注意不能用 `quota.FetchQuota` 代替：它经 Store 解析账号，而 probe 刻意不在池中，
+   会直接回「账号已不存在」——这是实现时踩到的坑。
+3. **不回显任何账号信息** — 响应只有状态，无 ID/邮箱/额度/账号列表；
+   `/guest/api/info` 只报一个布尔量，不回显邀请码本身。
+
+访问控制：邀请码（存 settings，后台可改/可清空）+ 每 IP 每日 3 次配额。
+**未设邀请码时入口关闭**（fail closed）。配额在 start 阶段扣减——每个 flow 会
+占内存直到 TTL 过期，不限制 start 本身就是资源泄漏；访客 flow 绑定来源 IP，
+授权链接被转发也无法跨 IP 完成。
+
+新增文件：`internal/guest/guest.go`（+ 测试）、`frontend/src/pages/guest.tsx`；
+`auth` 增加邀请码与配额；`gateway.Engine` 增加 `TestAccount`；`web/spa.go` 放行
+`/guest` 路由（否则页面 404）。
+
+**部署前提**：实测需要验证码求解器，故访客提交要求 `ZCODE_CAPTCHA_BROWSER=true`。
+
+验证：浏览器端到端（页面渲染、按钮禁用态、授权跳转、非法回调被拒、关闭态切换）+
+配额 429 实测 + 未完成授权时确认零账号入池；`go test ./...` 与 `-race` 全绿。
+
 ### 审查中确认**无缺陷**的范围
 
 - 死锁：22 个 `Update` 调用点的闭包体逐一核对，无嵌套加锁（`model` 包方法皆不引用 `Store`）。
@@ -581,7 +695,7 @@ Previous read at ... by goroutine 11:
 ## 7. 测试策略
 
 - 单测**逐个移植** Python 版 `tests/`（错误分类、池协议、路由白名单、quota 合并、oauth、usage、鉴权引导），
-  保持同名用例语义，便于两边对照。当前 24 个测试文件、197 个 `Test` 函数，`go test ./...` 全绿。
+  保持同名用例语义，便于两边对照。当前 26 个测试文件、214 个 `Test` 函数，`go test ./...` 全绿。
 - OpenAI 转换层：§5.7 每条映射一行单测；流式重编码按事件序列断言输出 chunk 序列；
   最终用 openai 官方客户端（python）指向网关做真客户端回归（待真实账号环境）。
 - httptest 起完整服务打 mock 上游做端到端；SSE 用 `curl -N` 与 Python 版逐字节对比分块行为。
@@ -604,9 +718,9 @@ Previous read at ... by goroutine 11:
 ## 9. 交付形态
 
 - `go build ./cmd/zcode2api` → 单二进制（前端已 embed），仅 Chromium 运行库为外部依赖。
-- Release CI：推 `v*` tag → GitHub Actions 交叉编译五平台产物
-  （linux/amd64、linux/arm64、darwin/amd64、darwin/arm64、windows/amd64；
-  CGO_ENABLED=0，`-trimpath -ldflags="-s -w"`）→ 上传 GitHub Releases。
+- Release CI：推 `v*` tag → GitHub Actions 交叉编译 Linux 产物
+  （linux/amd64、linux/arm64；CGO_ENABLED=0，`-trimpath -ldflags="-s -w"`）
+  → 上传 GitHub Releases。仅发布这两个平台。
 - **Linux 一键部署（`deploy/manage.sh`，单一入口）**：
   - 交互式选单：安装/更新/卸载二进制、查看状态、服务控制（启停/重启/日志）、Docker 三个操作。
   - 非交互子命令：`install` / `update` / `uninstall` / `status` / `docker-install` /

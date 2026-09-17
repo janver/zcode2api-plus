@@ -1,4 +1,4 @@
-/* 系統設定頁：後台密碼、網關 API Key、額度刷新間隔與使用說明 */
+/* 系統設定頁：後台密碼、網關 API Key、額度刷新間隔、訪客邀請碼、人機驗證與使用說明 */
 import { useEffect, useState, type FormEvent } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Loader2 } from 'lucide-react'
@@ -21,6 +21,10 @@ export function SettingsPage() {
   const [adminKeyInput, setAdminKeyInput] = useState('')
   const [gatewayKey, setGatewayKey] = useState('')
   const [quotaInterval, setQuotaInterval] = useState('60')
+  const [inviteCode, setInviteCode] = useState('')
+  const [capInstance, setCapInstance] = useState('')
+  const [capSiteKey, setCapSiteKey] = useState('')
+  const [capSecret, setCapSecret] = useState('')
   const [showKeys, setShowKeys] = useState(false)
   const [saving, setSaving] = useState(false)
 
@@ -30,6 +34,10 @@ export function SettingsPage() {
     setAdminKeyInput(data.admin_key || '')
     setGatewayKey(data.gateway_key || '')
     setQuotaInterval(String(data.quota_refresh_interval ?? 60))
+    setInviteCode(data.guest_invite_code || '')
+    setCapInstance(data.cap_instance || '')
+    setCapSiteKey(data.cap_site_key || '')
+    setCapSecret(data.cap_secret || '')
   }, [data])
 
   async function save(e: FormEvent) {
@@ -53,6 +61,10 @@ export function SettingsPage() {
         admin_key: adminKeyInput.trim(),
         gateway_key: gatewayKey.trim(),
         quota_refresh_interval: interval,
+        guest_invite_code: inviteCode.trim(),
+        cap_instance: capInstance.trim(),
+        cap_site_key: capSiteKey.trim(),
+        cap_secret: capSecret.trim(),
       })
       /* 同步本機儲存的密鑰，避免改密後被登出 */
       await adminKey.set(adminKeyInput.trim())
@@ -103,10 +115,6 @@ export function SettingsPage() {
                 onChange={(e) => setGatewayKey(e.target.value)}
               />
             </div>
-            <label className="flex w-fit cursor-pointer items-center gap-2 text-xs text-muted-foreground">
-              <Checkbox checked={showKeys} onCheckedChange={(v) => setShowKeys(v === true)} />
-              顯示密鑰明文
-            </label>
             <div className="flex flex-col gap-2">
               <Label htmlFor="set-quota-interval">額度刷新間隔（秒）</Label>
               <div className="text-xs text-muted-foreground">
@@ -121,6 +129,82 @@ export function SettingsPage() {
                 onChange={(e) => setQuotaInterval(e.target.value)}
               />
             </div>
+            <div className="flex flex-col gap-2">
+              <Label htmlFor="set-invite-code">訪客邀請碼</Label>
+              <div className="text-xs text-muted-foreground">
+                設定後 <code className="rounded bg-muted px-1">/guest</code>{' '}
+                頁面即對外開放，訪客可透過 Z.AI 授權提交自己的帳號（實測通過才入池）。
+                <span className="font-medium text-foreground">留空即關閉訪客入口</span>
+                ，每 IP 每日最多 3 次。修改後即時生效。
+              </div>
+              <Input
+                id="set-invite-code"
+                type={showKeys ? 'text' : 'password'}
+                value={inviteCode}
+                placeholder="留空則關閉訪客提交"
+                onChange={(e) => setInviteCode(e.target.value)}
+              />
+            </div>
+            <div className="flex flex-col gap-2">
+              <Label htmlFor="set-cap-instance">人機驗證實例地址（Cap）</Label>
+              <div className="text-xs text-muted-foreground">
+                自建 Cap 實例的公開地址，不含 site key，例如{' '}
+                <code className="rounded bg-muted px-1">https://cap.example.com</code>。
+                須為訪客瀏覽器可達的地址。
+              </div>
+              <Input
+                id="set-cap-instance"
+                type="text"
+                value={capInstance}
+                placeholder="https://cap.example.com"
+                onChange={(e) => setCapInstance(e.target.value)}
+              />
+            </div>
+            <div className="flex flex-col gap-2">
+              <Label htmlFor="set-cap-site-key">Site Key（Cap）</Label>
+              <div className="text-xs text-muted-foreground">
+                Cap 後台建立 site key 後取得的識別碼，例如{' '}
+                <code className="rounded bg-muted px-1">d9256640cb53</code>。
+              </div>
+              <Input
+                id="set-cap-site-key"
+                type="text"
+                value={capSiteKey}
+                placeholder="d9256640cb53"
+                onChange={(e) => setCapSiteKey(e.target.value)}
+              />
+            </div>
+            <div className="flex flex-col gap-2">
+              <Label htmlFor="set-cap-secret">密鑰（Cap）</Label>
+              <div className="text-xs text-muted-foreground">
+                Cap 後台的 secret key（<span className="font-medium text-foreground">不是</span>
+                管理員 ADMIN_KEY）。只留在服務端，不會下發給瀏覽器。
+              </div>
+              <Input
+                id="set-cap-secret"
+                type={showKeys ? 'text' : 'password'}
+                value={capSecret}
+                onChange={(e) => setCapSecret(e.target.value)}
+              />
+            </div>
+            <div className="rounded-lg bg-muted/50 px-3 py-2 text-xs text-muted-foreground">
+              {capInstance.trim() && capSiteKey.trim() && capSecret.trim() ? (
+                <>
+                  人機驗證已啟用，實際呼叫地址：
+                  <code className="ml-1 break-all rounded bg-muted px-1 font-mono">
+                    {capInstance.trim().replace(/\/+$/, '')}/{capSiteKey.trim().replace(/^\/+|\/+$/g, '')}/siteverify
+                  </code>
+                </>
+              ) : capInstance.trim() || capSiteKey.trim() || capSecret.trim() ? (
+                <span className="text-destructive">三項須全部填寫才會啟用；只填部分無法儲存。</span>
+              ) : (
+                '三項皆留空即停用人機驗證。'
+              )}
+            </div>
+            <label className="flex w-fit cursor-pointer items-center gap-2 text-xs text-muted-foreground">
+              <Checkbox checked={showKeys} onCheckedChange={(v) => setShowKeys(v === true)} />
+              顯示密鑰與邀請碼明文
+            </label>
             <div className="flex justify-end">
               <Button type="submit" disabled={saving}>
                 {saving ? <Loader2 className="animate-spin" /> : null}

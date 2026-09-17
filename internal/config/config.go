@@ -4,8 +4,8 @@
 package config
 
 import (
-	"crypto/rand"
-	"fmt"
+	"zcode2api/internal/util"
+
 	"os"
 	"path/filepath"
 	"strconv"
@@ -81,7 +81,10 @@ var (
 	CaptchaConfigCacheTTL = int64(envInt("CAPTCHA_CONFIG_CACHE_TTL", 600_000)) // ms，上游配置
 	CaptchaManualCacheTTL = int64(envInt("CAPTCHA_MANUAL_CACHE_TTL", 45_000))  // ms，人工回填
 
-	CaptchaSolveTimeout = envInt("ZCODE_CAPTCHA_TIMEOUT", 40) // 每次求解超时（秒）
+	// 每次求解超时（秒）。与同组 CaptchaBrowser* 一致做下界钳制：0 或负值会让
+	// deadline 立即过期（每次求解都瞬时超时且不触发冷却），极大值会在
+	// time.Duration 乘法处溢出成负值，同样立即超时。
+	CaptchaSolveTimeout = min(max(1, envInt("ZCODE_CAPTCHA_TIMEOUT", 40)), 3600)
 
 	// 真实 Chromium（rod 驱动 cloakbrowser 下载的浏览器二进制）。
 	CaptchaBrowserEnabled         = envBool("ZCODE_CAPTCHA_BROWSER", false)
@@ -124,7 +127,7 @@ var (
 	UserAgent = env("UPSTREAM_USER_AGENT", "ZCode/"+ZcodeClientVersion)
 
 	// AppVersion 供 /meta 与后台展示；-go 后缀标识运行时版本。
-	AppVersion = "2.0.2-go"
+	AppVersion = "2.0.6-go"
 )
 
 // ── 设备身份 ────────────────────────────────────────────────────────────────
@@ -144,7 +147,7 @@ func DeviceMid() string {
 				return
 			}
 		}
-		mid := newUUID()
+		mid := util.NewUUID()
 		_ = os.MkdirAll(DataDir, 0o755)
 		_ = os.WriteFile(path, []byte(mid), 0o644)
 		deviceMid = mid
@@ -153,10 +156,3 @@ func DeviceMid() string {
 }
 
 // newUUID 生成 UUIDv4（不引入第三方依赖）。
-func newUUID() string {
-	var b [16]byte
-	_, _ = rand.Read(b[:])
-	b[6] = (b[6] & 0x0f) | 0x40
-	b[8] = (b[8] & 0x3f) | 0x80
-	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
-}

@@ -2,7 +2,7 @@
 
 本目錄提供 Linux 的一鍵部署：**裸二進制 + systemd**（推薦、已實測）與 **Docker**（未經驗證）。
 
-Windows / macOS 直接下載 Releases 二進制執行即可，無需本目錄的腳本。
+本目錄面向 Linux 服務端；Releases 僅提供 linux/amd64 與 linux/arm64 產物。
 
 > ⚠️ **Docker 方案不提供任何保證**
 >
@@ -36,13 +36,13 @@ sudo ./deploy/manage.sh          # 交互式選單
 選單結構：
 
 ```
-  二进制: 已安装 v2.0.1-go [active]
-  Docker 已安装
+  二進制: 已安裝 v2.0.1-go [active]
+  Docker 已安裝
 
-  1) 安装二进制          5) Docker 安装（未验证）
-  2) 更新二进制          6) Docker 更新
-  3) 卸载二进制          7) Docker 卸载
-  4) 查看状态            8) 服务控制（启停/重启/日志）
+  1) 安裝二進制          5) Docker 安裝（未驗證）
+  2) 更新二進制          6) Docker 更新
+  3) 卸載二進制          7) Docker 卸載
+  4) 查看狀態            8) 服務控制（啟停/重啟/日誌）
   0) 退出
 ```
 
@@ -53,20 +53,103 @@ sudo ./deploy/manage.sh install            # 二進制安裝
 sudo ./deploy/manage.sh update             # 更新（自動比對 Release 版本）
 sudo ./deploy/manage.sh uninstall          # 卸載
 sudo ./deploy/manage.sh status             # 查看狀態
+sudo ./deploy/manage.sh scan               # 掃描 /opt 下已有的安裝
+sudo ./deploy/manage.sh adopt --dir /opt/zcode2api-custom   # 納管手工部署
+sudo ./deploy/manage.sh migrate --dir /opt/zcode2api-custom # 遷移到標準目錄並升級
 sudo ./deploy/manage.sh docker-install     # Docker 安裝
 sudo ./deploy/manage.sh docker-update      # Docker 更新
 sudo ./deploy/manage.sh docker-uninstall   # Docker 卸載
 ```
 
+### 納管手工編譯的部署
+
+若二進制是自己編譯後手工放置的（沒有 `.installed-version`、沒有 systemd 單元），
+管理腳本的固定 `$DIR` 看不見它，`update` / `status` 會誤報「未安裝」。用 `scan`
+找出來，再用 `adopt` 納管：
+
+```bash
+sudo ./deploy/manage.sh scan
+#    /opt/zcode2api-custom/zcode2api
+#      版本       2.0.3-go
+#      大小       15.5 MB
+#      狀態       未運行
+#      關聯        .env data
+#      可接管    sudo manage.sh adopt --dir /opt/zcode2api-custom
+
+sudo ./deploy/manage.sh adopt --dir /opt/zcode2api-custom
+```
+
+`scan` 只報告、不改動任何東西；`adopt` 才會寫入 `.installed-version` 與 systemd
+單元。要點：
+
+- **不動你的二進制**。接管只補管理所需的元數據與單元，不覆蓋自行編譯的產物。
+- **版本從二進制提取**。手工編譯沒有版本記錄，`adopt` 直接從二進制內嵌的
+  `AppVersion` 讀取，寫成 `.installed-version` 供後續 `update` 比對。
+- **舊單元會被停用**。若既有服務用的不是 `zcode2api.service`（例如
+  `zcode-legacy.service`），接管會停用它並改用標準單元——否則兩個單元會同時
+  拉起同一二進制、爭搶同一端口。
+
+**部署已在 `/opt/zcode2api`**（手工放進去、非腳本安裝）時同樣適用——目錄無需搬動，
+`adopt` 就地補上 `.installed-version` 與 systemd 單元：
+
+```bash
+sudo ./deploy/manage.sh adopt --dir /opt/zcode2api
+# 之後即可直接
+sudo ./deploy/manage.sh update
+```
+
+搬動過的部署，後續命令需顯式指定目錄：
+
+```bash
+sudo ./deploy/manage.sh update --dir /opt/zcode2api-custom
+```
+
+> 註：`scan` / `adopt` 只在 `/opt` 下查找（`SCAN_ROOT` 可覆寫）。若部署在別處，
+> 用 `find / -name 'zcode2api*' -type f -executable` 自行確認。
+
+### 遷移到標準目錄並升級
+
+`adopt` 只補管理元數據，不換二進制。若要把散落的舊部署收攏到標準目錄
+`/opt/zcode2api` 並升級到最新 Release，用 `migrate`：
+
+```bash
+sudo ./deploy/manage.sh migrate --dir /opt/zcode2api-custom
+```
+
+執行流程（每步都可回滾）：
+
+1. **停止舊服務**。必須在拷貝數據前停——數據庫以 WAL 模式運行，最近的寫入還在
+   `accounts.db-wal` 裡，運行中拷貝會得到不一致的快照。
+2. **記錄源賬號數**作為基線。
+3. **下載目標版本**到新目錄，舊二進制備份為 `zcode2api.pre-migrate`。
+4. **遷移數據**：用 SQLite 自身的 `.backup` 導出一致快照（而非 `cp`，見上）；
+   同時遷移 `.env`（端口、密鑰都在裡面）。
+5. **校驗賬號數**。數量不符即中止且不切換——寧可停下讓人檢查，也不帶著殘缺數據上線。
+6. **切換並啟動**，寫入 systemd 單元。
+7. **詢問是否刪除舊目錄**。數據已確認遷移後才問；選否則保留，可手動清理。
+
+原地升級：若源目錄本就是 `/opt/zcode2api`，則無處可搬，直接原地替換二進制，
+`data/` 與 `.env` 不動（`migrate` 輸出會標明「原地升級」）。
+
+目標目錄已被佔用（存在另一個部署）時，會改用 `/opt/zcode2api-migrated`，
+避免把兩個不同實例合併到同一目錄。
+
+交互式：菜單選 `10)` 會先掃描候選並列出各自版本，選一個即可，無需手打路徑。
+
+> ⚠️ `migrate` 查詢最新 Release 走 GitHub API（未認證限流為每小時 60 次/IP）。
+> 撞限流時會提示改用 `--version TAG` 指定標籤。
+
 ### 常用選項
 
 ```bash
---dir DIR            # 安裝目錄（預設 /opt/zcode2api）
+--dir DIR            # 安裝目錄（預設 /opt/zcode2api）；adopt 時為待接管目錄
 --port PORT          # 監聽端口（預設 3000）
 --host ADDR          # 監聽地址（預設 0.0.0.0；反向代理後建議 127.0.0.1）
 --user USER          # 以非特權賬號運行（不存在則自動建立）
 --local              # 從本機源碼構建（需 Go 工具鏈）
 --version TAG        # 指定 Release 標籤，預設取最新
+                     # GitHub API 未認證限流（每小時 60 次/IP）時，查詢會返回空
+                     # 導致更新中止，此時用本選項繞開查詢
 --no-browser         # 不裝驗證碼瀏覽器依賴（改用後台人工回填）
 --no-prefetch-browser  # 安裝時不預下載 Chromium（預設會下載，約 200MB）
 --no-deps            # 跳過系統依賴安裝

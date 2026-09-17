@@ -517,10 +517,17 @@ func (h *Handler) handleCaptchaSubmit(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleGetSettings(w http.ResponseWriter, r *http.Request) {
+	capCfg := h.Auth.CapConfig()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"admin_key":              h.Store.AdminKey(),
 		"gateway_key":            h.Store.GatewayKey(),
 		"quota_refresh_interval": h.Store.QuotaRefreshInterval(),
+		// 邀请码回显给管理员（后台已鉴权）；空值表示访客入口关闭
+		"guest_invite_code": h.Auth.InviteCode(),
+		// 人机验证配置；三项对应 Cap 后台给出的值，全空表示未启用
+		"cap_instance": capCfg.Instance,
+		"cap_site_key": capCfg.SiteKey,
+		"cap_secret":   capCfg.Secret,
 	})
 }
 
@@ -551,6 +558,43 @@ func (h *Handler) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		if err := h.Store.SetSetting("gateway_key", key); err != nil {
 			writeError500(w, err)
 			return
+		}
+	}
+	if v, ok := payload["guest_invite_code"]; ok {
+		// 空值合法：表示关闭访客入口（与 admin_key/gateway_key 的必填语义相反）
+		if err := h.Auth.SetInviteCode(strings.TrimSpace(strOf(v))); err != nil {
+			writeError500(w, err)
+			return
+		}
+	}
+	if _, ok := payload["cap_instance"]; ok {
+		// 三项一起处理：分开写会让「改了地址但没改 site key」的中间态落库，
+		// 那一刻校验指向旧组合而全部失败。
+		instance := strings.TrimSpace(strOf(payload["cap_instance"]))
+		siteKey := strings.TrimSpace(strOf(payload["cap_site_key"]))
+		secret := strings.TrimSpace(strOf(payload["cap_secret"]))
+
+		// 任一为空即视为停用，此时三项一起清空：留下残值会让下次启用时
+		// 混进上一次的旧值，而管理员以为自己填的是新组合。
+		if instance == "" || siteKey == "" || secret == "" {
+			if instance != "" || siteKey != "" || secret != "" {
+				// 部分填写：不静默接受，否则管理员以为已启用实则没有
+				writeAPIError(w, errBadRequest("人机验证需同时填写实例地址、Site Key 与密钥；三项皆留空即停用"))
+				return
+			}
+			if err := h.Auth.SetCapConfig("", "", ""); err != nil {
+				writeError500(w, err)
+				return
+			}
+		} else {
+			if !strings.HasPrefix(instance, "http://") && !strings.HasPrefix(instance, "https://") {
+				writeAPIError(w, errBadRequest("实例地址必须以 http:// 或 https:// 开头"))
+				return
+			}
+			if err := h.Auth.SetCapConfig(instance, siteKey, secret); err != nil {
+				writeError500(w, err)
+				return
+			}
 		}
 	}
 	if v, ok := payload["quota_refresh_interval"]; ok {

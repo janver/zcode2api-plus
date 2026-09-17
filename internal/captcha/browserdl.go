@@ -7,6 +7,7 @@ package captcha
 import (
 	"archive/tar"
 	"archive/zip"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/ed25519"
@@ -20,7 +21,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync"
 	"time"
 
 	"zcode2api/internal/web"
@@ -45,7 +45,24 @@ var (
 )
 
 // downloadMutex 串行化并发下载（多 worker 同时冷启动只下载一次）。
-var downloadMutex sync.Mutex
+//
+// 用 channel 而非 sync.Mutex：等待方需要能被调用方的 ctx 取消。首次下载
+// 约 200MB、上限 downloadTimeout（10 分钟），而调用方的启动超时通常只有
+// 90s——不可取消的等待会让槽位 goroutine 在调用方早已放弃后继续被扣住，
+// cm.Close() 也取消不掉。
+var downloadMutex = make(chan struct{}, 1)
+
+// lockDownload 获取下载锁，等待可被 ctx 取消。
+func lockDownload(ctx context.Context) error {
+	select {
+	case downloadMutex <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func unlockDownload() { <-downloadMutex }
 
 // cloakBinaryDir 版本对应的安装目录（对齐 cloakbrowser get_binary_dir）。
 func cloakBinaryDir(version string) string {
@@ -172,8 +189,10 @@ func EnsureBrowserBinary(ctx context.Context) (string, error) {
 
 // ensureVersion 指定版本与包名的下载安装链路（测试可注入假源）。
 func ensureVersion(ctx context.Context, version, archiveName string) (string, error) {
-	downloadMutex.Lock()
-	defer downloadMutex.Unlock()
+	if err := lockDownload(ctx); err != nil {
+		return "", err
+	}
+	defer unlockDownload()
 
 	dir := cloakBinaryDir(version)
 	if info, err := os.Stat(filepath.Join(dir, executableName())); err == nil && !info.IsDir() {
@@ -277,7 +296,7 @@ func extractArchive(archive []byte, archiveName, dest string) error {
 }
 
 func extractTarGz(archive []byte, dest string) error {
-	gz, err := gzip.NewReader(strings.NewReader(string(archive)))
+	gz, err := gzip.NewReader(bytes.NewReader(archive))
 	if err != nil {
 		return err
 	}
@@ -331,7 +350,14 @@ func extractTarGz(archive []byte, dest string) error {
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 				return err
 			}
-			src := filepath.Join(dest, filepath.Clean(hdr.Linkname))
+			// Linkname 必须与 Name 一样做逃逸校验：filepath.Join 会 Clean 掉
+			// ".."，../../../../etc/passwd 会解析成解包目录之外的路径，
+			// 使 os.ReadFile 读到宿主任意文件并写进安装目录。
+			link := filepath.Clean(hdr.Linkname)
+			if filepath.IsAbs(link) || strings.HasPrefix(link, "..") {
+				return fmt.Errorf("压缩包含非法硬链接: %s -> %s", hdr.Name, hdr.Linkname)
+			}
+			src := filepath.Join(dest, link)
 			data, err := os.ReadFile(src)
 			if err != nil {
 				return fmt.Errorf("硬链接源不可读 %s: %w", hdr.Name, err)
@@ -347,7 +373,7 @@ func extractTarGz(archive []byte, dest string) error {
 }
 
 func extractZip(archive []byte, dest string) error {
-	zr, err := zip.NewReader(strings.NewReader(string(archive)), int64(len(archive)))
+	zr, err := zip.NewReader(bytes.NewReader(archive), int64(len(archive)))
 	if err != nil {
 		return err
 	}

@@ -6,7 +6,6 @@ package gateway
 import (
 	"bytes"
 	"context"
-	cryptoRand "crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,6 +22,7 @@ import (
 	"zcode2api/internal/proxy"
 	"zcode2api/internal/store"
 	"zcode2api/internal/upstream"
+	"zcode2api/internal/util"
 	"zcode2api/internal/web"
 )
 
@@ -61,7 +61,7 @@ func NewEngine(st *store.Store, cm *captcha.Manager, client *http.Client) *Engin
 		Store:           st,
 		Captcha:         cm,
 		Client:          client,
-		BusyRetryDelays: []time.Duration{time.Second, 2 * time.Second},
+		BusyRetryDelays: startPlanBusyRetryDelays,
 		now:             time.Now,
 	}
 }
@@ -118,7 +118,7 @@ type attemptResult struct {
 func (e *Engine) RunMessages(ctx context.Context, body map[string]any, incomingHeaders map[string]string, deliver DeliverFunc) runResult {
 	modelName, _ := body["model"].(string)
 	stream := bodyBool(body, "stream")
-	reqID := randomHex(3)
+	reqID := util.RandomHex(3)
 	web.Req(reqID, orDash(modelName), stream)
 
 	tried := map[string]bool{}
@@ -146,6 +146,72 @@ func (e *Engine) RunMessages(ctx context.Context, body map[string]any, incomingH
 	web.ReqErr(reqID, "无可用账号 / 额度均已耗尽")
 	return errResult(http.StatusServiceUnavailable, "no_available_account",
 		"所有账号均不可用或额度已用完，请在后台检查账号状态")
+}
+
+// TestAccountResult 定向测试单个账号的结果。
+type TestAccountResult struct {
+	OK     bool   // 上游返回了可交付的 200 响应
+	Status int    // 失败时的 HTTP 状态码（OK 时为 200）
+	Reason string // 失败原因（面向调用方的简述，不含凭证）
+}
+
+// TestAccount 对指定账号发起一次真实的最小请求，验证其确实可用。
+//
+// 与 RunMessages 的区别：不做选号轮询，只测这一个账号；不交付给客户端，
+// 只判断上游是否给出了可用的 200 响应。用于访客提交账号时「测试调用一次
+// 才能入池」——OAuth 授权只证明访客持有该账号，不证明它当下能服务请求。
+//
+// 注意：本方法会写账号状态（401 标 invalid、429 标 cooling 等），这正是
+// 期望行为——测试失败就该如实反映在账号状态上。
+func (e *Engine) TestAccount(ctx context.Context, acc *model.Account, modelName string) TestAccountResult {
+	if acc == nil {
+		return TestAccountResult{OK: false, Status: http.StatusBadRequest, Reason: "账号不存在"}
+	}
+	if modelName == "" {
+		modelName = AvailableModels[len(AvailableModels)-1]
+	}
+
+	body := map[string]any{
+		"model":      modelName,
+		"max_tokens": float64(1),
+		"messages": []any{
+			map[string]any{"role": "user", "content": "ping"},
+		},
+	}
+	reqID := util.RandomHex(3)
+	web.Req(reqID, orDash(modelName), false)
+
+	// 收集型 deliver：TestAccount 只关心上游是否给了 200，不把内容写出去。
+	// 必须读完 Body，否则引擎的 usage 统计与连接复用都会受影响。
+	var delivered bool
+	deliver := func(d Delivery) error {
+		delivered = true
+		_, _ = io.Copy(io.Discard, d.Body)
+		return nil
+	}
+
+	res := e.tryAccount(ctx, reqID, acc, body, modelName, false, nil, deliver)
+	if delivered {
+		web.ReqOk(reqID, 0)
+		return TestAccountResult{OK: true, Status: http.StatusOK}
+	}
+
+	// 未交付：res.final 携带失败原因（switchAccount/retryCaptcha 在单账号
+	// 语境下等价于「这次尝试没能拿到 200」）。
+	status := res.final.Status
+	if status == 0 {
+		status = http.StatusBadGateway
+	}
+	reason := "上游未返回可用响应"
+	if body, ok := res.final.Body.(map[string]any); ok {
+		if errObj, ok := body["error"].(map[string]any); ok {
+			if msg, ok := errObj["message"].(string); ok && msg != "" {
+				reason = msg
+			}
+		}
+	}
+	web.ReqErr(reqID, reason)
+	return TestAccountResult{OK: false, Status: status, Reason: reason}
 }
 
 // tryAccount 单个账号的尝试：内层为验证码重试（对齐 MAX_CAPTCHA_RETRIES）。
@@ -181,7 +247,7 @@ func (e *Engine) tryAccount(
 		// 每个账号在副本上做 NormalizeBody（system 注入不幂等，见 body.go）
 		actualBody := shallowCopyBody(body)
 		NormalizeBody(actualBody, needsCaptcha)
-		payload, err := marshalJSON(actualBody)
+		payload, err := util.MarshalJSON(actualBody)
 		if err != nil {
 			web.Err(reqID, fmt.Sprintf("请求体序列化失败: %v", err))
 			return attemptResult{final: errResult(http.StatusBadRequest, "invalid_request", "请求体无法序列化")}
@@ -309,8 +375,8 @@ func (e *Engine) handleUpstreamError(
 
 	// 3) 402 → 该模型耗尽
 	if resp.StatusCode == http.StatusPaymentRequired {
-		e.markModelExhausted(acc, modelName, fmt.Sprintf("%s 額度已用完", orCurrent(modelName)))
-		web.Warn(reqID, fmt.Sprintf("账号 %s 的 %s 額度用完，切換下一個", acc.Name, orCurrent(modelName)))
+		e.markModelExhausted(acc, modelName, fmt.Sprintf("%s 額度已用完", OrCurrent(modelName)))
+		web.Warn(reqID, fmt.Sprintf("账号 %s 的 %s 額度用完，切換下一個", acc.Name, OrCurrent(modelName)))
 		e.fireRefresh(acc)
 		return attemptResult{switchAccount: true}
 	}
@@ -337,8 +403,8 @@ func (e *Engine) handleUpstreamError(
 	// 5) 429：官方用量上限码族 → 该模型耗尽；其余瞬时限流 → 冷却
 	if resp.StatusCode == http.StatusTooManyRequests {
 		if quotaExhaustedCodes[UpstreamBusinessCode(text)] {
-			e.markModelExhausted(acc, modelName, fmt.Sprintf("%s 額度/用量上限已達", orCurrent(modelName)))
-			web.Warn(reqID, fmt.Sprintf("账号 %s 的 %s 觸發用量上限，切換下一個", acc.Name, orCurrent(modelName)))
+			e.markModelExhausted(acc, modelName, fmt.Sprintf("%s 額度/用量上限已達", OrCurrent(modelName)))
+			web.Warn(reqID, fmt.Sprintf("账号 %s 的 %s 觸發用量上限，切換下一個", acc.Name, OrCurrent(modelName)))
 			e.fireRefresh(acc)
 		} else {
 			e.mark(acc, model.StatusCooling, "上游限流 HTTP 429")
@@ -382,8 +448,8 @@ func (e *Engine) handleUpstreamJSON(
 
 	switch {
 	case code == "1005":
-		e.markModelExhausted(acc, modelName, fmt.Sprintf("%s 每日額度已用完", orCurrent(modelName)))
-		web.Warn(reqID, fmt.Sprintf("帳號 %s 的 %s 每日額度用完，切換下一個", acc.Name, orCurrent(modelName)))
+		e.markModelExhausted(acc, modelName, fmt.Sprintf("%s 每日額度已用完", OrCurrent(modelName)))
+		web.Warn(reqID, fmt.Sprintf("帳號 %s 的 %s 每日額度用完，切換下一個", acc.Name, OrCurrent(modelName)))
 		e.fireRefresh(acc)
 		return attemptResult{switchAccount: true}
 
@@ -591,15 +657,7 @@ func (e *Engine) captchaRequired(reqID, detail string) runResult {
 // ── 小工具 ──────────────────────────────────────────────────────────────────
 
 // marshalJSON 与 Python json.dumps(ensure_ascii=False) 对齐：不转义 HTML 字符。
-func marshalJSON(v any) ([]byte, error) {
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(v); err != nil {
-		return nil, err
-	}
-	return bytes.TrimRight(buf.Bytes(), "\n"), nil
-}
+
 
 // teeReader 在读取时同步餵入 usage 收集器。
 type teeReader struct {
@@ -695,7 +753,9 @@ func hasCaptchaChallengeHeader(header http.Header) bool {
 	return false
 }
 
-func orCurrent(modelName string) string {
+// OrCurrent 模型名为空时的占位文案。
+// 导出供 asyncpool 复用：两条路径对同一情境必须给出相同文案。
+func OrCurrent(modelName string) string {
 	if modelName == "" {
 		return "當前模型"
 	}
@@ -709,8 +769,4 @@ func orDash(modelName string) string {
 	return modelName
 }
 
-func randomHex(n int) string {
-	b := make([]byte, n)
-	_, _ = cryptoRand.Read(b)
-	return fmt.Sprintf("%x", b)
-}
+

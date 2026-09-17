@@ -19,6 +19,7 @@ Z.AI ZCode Coding Plan → OpenAI/Anthropic 兼容網關（**Go 版，現為主�
 | `POST /async/v1/messages` | Anthropic 異步 | ticket + keepalive + 流中斷語義 |
 | `GET /v1/models` | 雙兼容超集 | Anthropic 與 OpenAI 形態字段並存 |
 | `/admin/*` | — | 內嵌 React 管理後台 |
+| `/guest` | — | 訪客帳號提交頁（需管理員開啟邀請碼） |
 
 對外三種請求格式，內部統一走 Anthropic Messages 上游管道：選號循環、驗證碼求解、
 錯誤分類（401/402/429 碼族/3010/F001）、賬號狀態機與用量統計只維護一份。
@@ -26,7 +27,7 @@ Z.AI ZCode Coding Plan → OpenAI/Anthropic 兼容網關（**Go 版，現為主�
 ## 快速開始
 
 ```bash
-# 下載現成產物（Releases 頁：linux × amd64/arm64、darwin × amd64/arm64、windows × amd64）
+# 下載現成產物（Releases 頁：linux × amd64/arm64）
 # 或源碼構建：
 go build -o zcode2api ./cmd/zcode2api
 ./zcode2api serve            # http://127.0.0.1:3000
@@ -158,6 +159,8 @@ sudo ./deploy/manage.sh docker-install         # Docker（本地構建，未驗�
 | `ZCODE_CAPTCHA_BROWSER_BIN` | 自動發現 | Chromium 二進制路徑 |
 | `ZCODE_ASYNC_ENABLED` | true | 掛載 /async/v1/messages 空閒池 |
 
+訪客提交的邀請碼存於數據庫（後台「設置」頁可改），不走環境變量。
+
 ## 賬號級出站代理
 
 賬號配置 `proxy_url` 後，該賬號的網關請求、額度查詢與套餐領取均走對應代理；
@@ -172,13 +175,73 @@ JWT 賬號入池（批量添加 / OAuth / CLI login）後自動：激活事件�
 
 ## 發佈與開發
 
-- 推 `v*` tag → GitHub Actions 自動交叉編譯五平台產物（linux/amd64、linux/arm64、
-  darwin/amd64、darwin/arm64、windows/amd64）並上傳 Releases。
-- 全量驗證：`go build ./... && go vet ./... && go test ./...`；併發檢查 `go test -race ./...`
-  （需 C 工具鏈）。
-- 前端改動：`cd frontend && npm install && npm run build`，並把更新後的 `frontend/dist` 一併提交
-  （`dist` 已入庫並由 `go:embed` 打包）。
-- 行為契約與里程碑台账見 `PLAN.md`；交接注意事項見 `HANDOFF.md`。
+```bash
+go build ./... && go vet ./... && go test ./...   # 全量驗證
+go test -race ./...                               # 併發檢查（需 C 工具鏈）
+```
+
+- 推 `v*` tag → GitHub Actions 自動交叉編譯 Linux 產物（linux/amd64、linux/arm64）
+  並上傳 Releases。僅維護這兩個平台：本項目面向服務端自部署。
+- 前端改動：`cd frontend && npm install && npm run build`，把更新後的 `frontend/dist`
+  一併提交（`dist` 已入庫並由 `go:embed` 打包；改版後要刪掉舊的 hash 檔）。
+- 行為契約與里程碑台账見 [`PLAN.md`](PLAN.md)（唯一權威，含逐項驗收狀態）。
+
+### 維護者注意
+
+- **`deploy/manage.sh` 的 systemd 模板有兩份**：`deploy/zcode2api.service` 與腳本內
+  `write_unit()` 的 heredoc（單獨下載腳本時走後者）。改模板時**兩處都要改**。
+- **部署腳本必須保持 LF**：`.gitattributes` 已對 `*.sh` / `*.service` 強制 `eol=lf`，
+  改動後用 `git ls-files --eol deploy/` 確認索引為 `i/lf`；可執行位用
+  `git update-index --chmod=+x` 設定（Windows 檔案系統不保留該位）。
+- **`.env` 不會被自動載入**：專案未引入 dotenv，`manage.sh` 產生的 `.env` 由 systemd
+  的 `EnvironmentFile` 讀取；本機直接跑二進制時需自行 source。
+- **`frontend/dist` 的 embed 宣告必須在倉庫根包**（`webui.go`）：`go:embed` 只能引用
+  宣告檔所在目錄樹內的文件，`internal/web` 無法引用它。
+- **上游回應形態**：zcode.z.ai 的非流式回應是**標準 Anthropic Messages 頂層形態**
+  （`id`/`content`/`stop_reason`/`usage` 都在頂層，**沒有**嵌套 `message` 物件）。
+  權威依據見 `internal/gateway/usage.go` 頭部註釋。
+- **測試隔離**：一律 `config.DBPath = filepath.Join(t.TempDir(), "accounts.db")`；
+  captcha 測試用 `SetSolver`（假求解器）+ `SetConfigProvider`（固定配置），否則會打真實
+  上游；e2e 帳號用 api_key 模式（憑證不含兩個點）即不觸發驗證碼路徑，離線穩定。
+
+## 訪客提交帳號
+
+管理員在後台「設置」頁填寫**邀請碼**後，`/guest` 頁面即對外開放（清空邀請碼
+即關閉）。訪客的提交路徑刻意比後台窄：
+
+### 人機驗證（可選，自建 Cap）
+
+在後台「設置」頁填入 Cap 後台給出的**三個值**即啟用：
+
+| 欄位 | 取自 Cap 後台 | 範例 |
+|------|--------------|------|
+| 實例地址 | 你的 Cap 部署地址（不含 site key） | `https://cap.example.com` |
+| Site Key | 建立 site key 後的識別碼 | `d9256640cb53` |
+| 密鑰 | **secret key**（不是管理員 ADMIN_KEY） | — |
+
+實際呼叫地址為 `{實例地址}/{Site Key}/`，設定頁會即時顯示拼出的結果供核對。
+
+- **三項都填**才啟用；只填部分會被拒絕儲存（避免留下半殘配置）。
+  三項皆留空即停用。
+- 密鑰**只留在服務端**，絕不下發瀏覽器；拼好的地址會回顯給前端（widget 需靠它取題）。
+- Site Key 填錯時返回 502（路徑不存在屬配置問題），而非報成「驗證未通過」。
+- 兩步各驗一次：Cap token 是一次性的，第一步用過即失效，第二步會自動重新求解。
+- 未配置時不渲染驗證元件、後端也跳過校驗——自建實例位址因部署而異，無法給預設值。
+- Cap 服務不可達時返回 502（管理員要查配置），而非報成「驗證未通過」誤導訪客。
+
+- **只走 OAuth 授權**，不提供令牌輸入框。完成授權能證明提交者確實持有該帳號；
+  貼上一串 JWT 什麼都證明不了。
+- **實測通過才入池**。授權只說明「現在持有」，不說明「當下可用」——帳號可能已
+  被封、額度耗盡或地區受限。後端會用該憑證發起一次最小的真實請求
+  （`max_tokens=1`），成功才寫入賬號池；失敗直接丟棄。
+- **不回顯任何帳號信息**。回應只有成功與否，不含 ID、郵箱、額度或賬號列表。
+- **邀請碼 + 每 IP 每日 3 次**。配額在開始授權時扣減；未設邀請碼時入口關閉
+  （fail closed）而非開放。
+- **可選人機驗證**。接入自建 [Cap](https://trycap.dev) 實例後，兩步各驗一次
+  （Cap token 一次性，第二步需重新求解）。未配置時整段跳過。
+
+> ⚠️ 實測需要驗證碼求解器，因此訪客提交**要求 `ZCODE_CAPTCHA_BROWSER=true`**；
+> 未啟用時提交會因驗證碼不可用而失敗。
 
 ## 賬號歸檔
 
