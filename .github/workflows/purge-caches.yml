@@ -1,0 +1,76 @@
+# 缓存清理 CI：手动触发，批量删除本仓库的 Actions 缓存。
+# GitHub 没有「删除全部缓存」的 REST 端点，全量删除只能分页拉取后逐个 DELETE，
+# 这里直接用 runner 预装的 gh（已封装该遍历），认证走 workflow 自带的 GITHUB_TOKEN，
+# 因此需要 actions: write 权限，本地无需配置 gh 或 PAT。
+# 背景：docker.yml 的 cache-to 一度是 type=gha,mode=max，会把全部中间层写入缓存；
+# 改成 mode=min 后只导出结果层，但存量仍需在此手动清理。
+# 注意：workflow_dispatch 的入口只在默认分支（go-rewrite）上出现。
+name: purge-caches
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 清理方式
+        type: choice
+        options: [all, key-prefix, stale]
+        default: all
+      key:
+        description: mode=key-prefix 时的 key 前缀（如 buildx）
+        type: string
+        default: ""
+      days:
+        description: mode=stale 时，删除超过多少天未访问的缓存
+        type: string
+        default: "7"
+
+permissions:
+  actions: write # 删除缓存所必需
+  contents: read
+
+jobs:
+  purge:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 清理前
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # 默认只列 30 条，这里放宽到 100（列表本身只用于查看，删不删得掉看下面的步骤）
+        run: gh cache list -R "$GITHUB_REPOSITORY" --limit 100
+
+      - name: 全部删除
+        if: inputs.mode == 'all'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # --succeed-on-no-caches 避免没有缓存时以非零码退出
+        run: gh cache delete --all -R "$GITHUB_REPOSITORY" --succeed-on-no-caches
+
+      - name: 按 key 前缀删除
+        if: inputs.mode == 'key-prefix'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          KEY: ${{ inputs.key }}
+        # key 端点支持前缀匹配，一次请求即可批量删除；传空会删掉全部，故先拦截
+        run: |
+          [[ -n "$KEY" ]] || { echo "key 不能为空"; exit 1; }
+          gh cache delete "$KEY" -R "$GITHUB_REPOSITORY"
+
+      - name: 删除 N 天未访问的缓存
+        if: inputs.mode == 'stale'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DAYS: ${{ inputs.days }}
+        # 只处理最近 100 条；缓存更多时需调大 --limit 或分批执行
+        run: |
+          cutoff=$(date -u -d "$DAYS days ago" +%s)
+          for id in $(gh cache list -R "$GITHUB_REPOSITORY" --limit 100 \
+              --json id,lastAccessedAt \
+              --jq ".[] | select((.lastAccessedAt | fromdateiso8601) < $cutoff) | .id"); do
+            gh cache delete "$id" -R "$GITHUB_REPOSITORY"
+          done
+
+      - name: 清理后
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh cache list -R "$GITHUB_REPOSITORY" --limit 100
