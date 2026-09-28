@@ -75,4 +75,5 @@ jobs:
           build-args: |
             VERSION=${{ steps.ver.outputs.value }}
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # mode=min 只导出结果层；mode=max 会把全部中间层写进 Actions cache，占用涨得很快。
+          cache-to: type=gha,mode=min
