@@ -1,5 +1,6 @@
 # Docker 镜像 CI：推 v* tag 时构建 linux/amd64 + linux/arm64 双架构镜像，
-# 推送到 GHCR（ghcr.io/<owner>/zcode2api-plus）；分支 push 与 PR 仅构建验证。
+# 推送到 GHCR（ghcr.io/<owner>/zcode2api-plus）。分支 push 与 PR 不触发，
+# 需要验证镜像构建时用 workflow_dispatch 手动运行。
 # 首次推送后镜像包默认为 Private，需到仓库 Settings → Packages 改为 Public
 # 才能免登录拉取。
 name: docker
@@ -7,9 +8,6 @@ name: docker
 on:
   push:
     tags: ["v*"]
-    branches: ["go-rewrite"]
-  pull_request:
-    branches: ["go-rewrite"]
   workflow_dispatch:
 
 env:
