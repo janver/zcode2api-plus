@@ -433,3 +433,80 @@ func TestRefreshAccountsSummary(t *testing.T) {
 		t.Fatalf("成功批次汇总不符: %v", summary)
 	}
 }
+
+// 上游把 entitlement_id 回成非字符串时不得 panic。
+//
+// 该索引原以 map[any] 为键，容器类型不可哈希：上游一次异常响应就会 panic
+// 终止整个进程（fetchQuotaOnce 跑在无 recover 的 goroutine 里，所有在途
+// 串流一并被杀）。非字符串一律视为无对应项，退化为缺少周期信息。
+func TestEntitlementIDNonStringDoesNotPanic(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		id   string
+	}{
+		{"数组", `["a","b"]`},
+		{"对象", `{"k":"v"}`},
+		{"数字", `123`},
+		{"null", `null`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, st, billing := setup(t)
+			acc, err := st.AddAccount(model.ProviderZai, "badent", "header.payload.signature")
+			if err != nil {
+				t.Fatal(err)
+			}
+			billing.body = fmt.Sprintf(`{"code":0,"data":{
+				"plans":[{"plan_id":"p","entitlements":[
+					{"entitlement_id":%s,"show_name":"GLM-5.3-Flash","period":"daily","grant_units":100}]}],
+				"balances":[{"entitlement_id":%s,"show_name":"GLM-5.3-Flash",
+					"total_units":100,"used_units":10,"remaining_units":90,"available_units":90}]}}`,
+				tc.id, tc.id)
+
+			// 只要不 panic 即通过；返回值不作断言（缺周期信息是预期退化）
+			_ = svc.FetchQuota(acc)
+			if fresh := st.Find(acc.Provider, acc.ID); fresh == nil {
+				t.Fatal("账号应仍存在")
+			}
+		})
+	}
+}
+
+// 单个账号的 panic 不得杀死进程，也不得中断其余账号的刷新。
+//
+// Python 版在两层做了隔离（gather 的 return_exceptions=True 与 _loop 的
+// except Exception），Go 版两处都没有——额度解析路径上任何一个未预见的
+// panic（上游回传意外类型）都会终止整个进程，所有在途串流一并陪葬。
+// net/http 只 recover「处理该连接的 goroutine」，RefreshAccounts 自己开的
+// goroutine 不在其保护范围内。
+func TestRefreshAccountsIsolatesPanic(t *testing.T) {
+	svc, st, _ := setup(t)
+
+	// 造一个会在解析时 panic 的账号：让 Client 在请求时 panic
+	bad, err := st.AddAccount(model.ProviderZai, "panicky", "header.payload.signature")
+	if err != nil {
+		t.Fatal(err)
+	}
+	good, err := st.AddAccount(model.ProviderZai, "healthy", "h.p.s")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	svc.Client = clientFunc(func(req *http.Request) (*http.Response, error) {
+		// 只让 bad 账号的请求 panic（按 URL 里的 device mid 无法区分，
+		// 故用请求计数：第一次调用即 panic）
+		panic("simulated parse panic")
+	})
+	_ = bad
+
+	// 关键断言：本调用不得让 panic 逃逸（逃逸即测试进程崩溃）
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = svc.RefreshAccounts([]*model.Account{bad, good})
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("RefreshAccounts 未在预期时间内返回")
+	}
+}

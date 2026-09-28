@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -24,6 +25,7 @@ import (
 	"zcode2api/internal/model"
 	"zcode2api/internal/proxy"
 	"zcode2api/internal/util"
+	"zcode2api/internal/web"
 )
 
 const (
@@ -49,6 +51,14 @@ type Store struct {
 	accounts map[string][]*model.Account
 	settings map[string]string
 	rotation map[string]int
+
+	// settingsSnapshot 是 settings 的不可变快照，供无锁读取。
+	//
+	// 读取 settings 的路径包含每次 API 请求的鉴权（VerifyGatewayKey →
+	// GetSetting），若与 Update 共用 s.mu，一次慢写（磁盘满、外部进程持写锁
+	// 时最多 busy_timeout 5s）会让所有请求的鉴权一起排队——DB 慢即服务不可用。
+	// 快照让读取完全不碰锁；写入仍是「改 map 后发布新快照」。
+	settingsSnapshot atomic.Pointer[map[string]string]
 
 	// GeneratedAdminKey / GeneratedGatewayKey：本次启动随机生成/轮换的密钥，
 	// 供启动横幅提示管理者（环境变量配置时不记录）。
@@ -208,6 +218,7 @@ func (s *Store) load() error {
 		settings["quota_refresh_interval"] = strconv.Itoa(config.QuotaRefreshInterval)
 	}
 	s.settings = settings
+	s.publishSettings()
 
 	accounts := map[string][]*model.Account{model.ProviderZai: {}}
 	rows, err = s.db.Query(fmt.Sprintf(
@@ -265,19 +276,81 @@ func (s *Store) setMeta(key, value string) error {
 // ── 设置 ────────────────────────────────────────────────────────────────────
 
 // GetSetting 读取设置（第二返回值表示是否存在）。
+//
+// 走原子快照而非 s.mu：鉴权路径（VerifyGatewayKey/VerifyAdminKey）每次都调用
+// 本函数，若与写路径共用锁，一次慢写就会让所有请求的鉴权排队。
 func (s *Store) GetSetting(key string) (string, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	v, ok := s.settings[key]
+	snap := s.settingsSnapshot.Load()
+	if snap == nil {
+		return "", false
+	}
+	v, ok := (*snap)[key]
 	return v, ok
 }
 
+// publishSettings 发布 settings 的不可变快照（调用方须持有 s.mu）。
+//
+// 复制一份而非共享原 map：快照必须不可变，否则读到一半被并发写会触发
+// Go 的并发 map 读写检测。
+func (s *Store) publishSettings() {
+	cp := make(map[string]string, len(s.settings))
+	for k, v := range s.settings {
+		cp[k] = v
+	}
+	s.settingsSnapshot.Store(&cp)
+}
+
 // SetSetting 更新设置并落库。
+// logPersistFailure 记录一次落库失败。
+//
+// 统计路径（网关计 token、异步池计状态、额度刷新）刻意忽略 Update 的错误——
+// 不该因为统计写不进去就让用户的对话请求失败。但完全静默会让「磁盘满导致
+// 统计与状态全部不落库」没有任何线索可查：后台数字与实际持久化状态脱节，
+// 重启后回滚，而日志里什么都没有。这里集中记一次，涵盖所有调用方。
+//
+// 调用方都持有 s.mu，故本函数必须自行确保「不在锁内做 I/O」——web.Warn 是同步
+// 的 stdout 写，stdout 阻塞（管道满、终端卡住）时会把整个 Store 锁住。做法是
+// 只在锁内做判断，把实际输出交给独立 goroutine。
+//
+// 节流到每分钟一条：落库持续失败时（磁盘满）每个请求都会走到这里，
+// 不节流会把日志刷爆并掩盖其他信息。
+func logPersistFailure(scope, detail string, err error) {
+	if err == nil {
+		return
+	}
+	persistLogMu.Lock()
+	now := time.Now()
+	allow := now.Sub(persistLogLast) >= persistLogInterval
+	if allow {
+		persistLogLast = now
+	}
+	persistLogMu.Unlock()
+	if !allow {
+		return
+	}
+	msg := fmt.Sprintf("落库失败（%s，%s）: %v；内存已改而 DB 未写入，重启后会回滚", scope, detail, err)
+	go web.Warn("store", msg)
+}
+
+var (
+	persistLogMu       sync.Mutex
+	persistLogLast     time.Time
+	persistLogInterval = time.Minute
+)
+
 func (s *Store) SetSetting(key, value string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// 先落库再改内存，与 AddAccount / RemoveAccount 同一原则：落库失败时内存
+	// 不能留下一个未持久化的值，否则本次进程按新值运行、重启后回滚，而调用方
+	// 收到错误以为没生效。
+	if err := s.setMeta(key, value); err != nil {
+		logPersistFailure("setting", key, err)
+		return err
+	}
 	s.settings[key] = value
-	return s.setMeta(key, value)
+	s.publishSettings()
+	return nil
 }
 
 func (s *Store) AdminKey() string {
@@ -344,6 +417,7 @@ func (s *Store) saveProxyProfilesLocked(profiles []ProxyProfile) error {
 		return err
 	}
 	s.settings["proxy_profiles"] = string(data)
+	s.publishSettings()
 	return s.setMeta("proxy_profiles", string(data))
 }
 
@@ -570,10 +644,13 @@ func (s *Store) AddAccount(provider, name, secret string) (*model.Account, error
 			return a.Clone(), nil // 跳过重复 token
 		}
 	}
-	s.accounts[provider] = append(s.accounts[provider], acc)
+	// 先落库再改内存：落库失败时内存不能留下一个不存在的账号。反过来会让
+	// 账号在本次进程里可用、重启后消失，而调用方收到 500 以为没建成。
 	if err := s.persistAccountLocked(acc); err != nil {
+		logPersistFailure("add", provider+"/"+acc.ID, err)
 		return nil, err
 	}
+	s.accounts[provider] = append(s.accounts[provider], acc)
 	return acc.Clone(), nil
 }
 
@@ -595,6 +672,13 @@ func (s *Store) RemoveAccount(provider, idOrName string) (bool, error) {
 	if target == nil {
 		return false, nil
 	}
+	// 先落库再改内存：反过来时落库失败会让内存与 DB 分叉——本次进程里账号
+	// 已消失，重启后又从 DB 载入回来。删除常被用来撤销可疑或外泄的凭证，
+	// 这种「显示已删除、实际还在」是安全相关的静默失败。
+	if err := s.deleteAccountLocked(target.ID); err != nil {
+		logPersistFailure("delete", provider+"/"+target.ID, err)
+		return false, err
+	}
 	remaining := items[:0:0]
 	for _, a := range items {
 		if a.ID != target.ID {
@@ -602,9 +686,6 @@ func (s *Store) RemoveAccount(provider, idOrName string) (bool, error) {
 		}
 	}
 	s.accounts[provider] = remaining
-	if err := s.deleteAccountLocked(target.ID); err != nil {
-		return false, err
-	}
 	return true, nil
 }
 
@@ -637,6 +718,9 @@ func (s *Store) Update(provider, id string, fn func(acc *model.Account)) error {
 
 	if !ok {
 		return ErrNotFound
+	}
+	if failed != nil {
+		logPersistFailure("update", provider+"/"+id, failed)
 	}
 	return failed
 }

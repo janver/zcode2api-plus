@@ -520,3 +520,119 @@ func TestSelectAndMutateConcurrently(t *testing.T) {
 
 	wg.Wait()
 }
+
+// 落库失败时不得改动内存：否则账号在本进程消失、重启后又从 DB 回来。
+//
+// 删除常被用来撤销可疑或外泄的凭证，「显示已删除、实际还在」是安全相关的
+// 静默失败。原实现先改内存再落库，失败时内存已不可逆。
+func TestRemoveAccountKeepsMemoryOnPersistFailure(t *testing.T) {
+	s := newTestStore(t)
+	acc, err := s.AddAccount(model.ProviderZai, "victim", "header.payload.signature")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Find(model.ProviderZai, acc.ID) == nil {
+		t.Fatal("前置条件：账号应存在")
+	}
+
+	// 关掉底层连接，让 DELETE 必然失败
+	if err := s.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	ok, err := s.RemoveAccount(model.ProviderZai, acc.ID)
+	if err == nil {
+		t.Fatal("落库失败应返回错误")
+	}
+	if ok {
+		t.Fatal("失败时不应报告已删除")
+	}
+	// 关键断言：内存状态必须与 DB 保持一致，账号仍在
+	if s.Find(model.ProviderZai, acc.ID) == nil {
+		t.Fatal("落库失败后账号不应从内存消失（会与 DB 分叉）")
+	}
+}
+
+// AddAccount 落库失败时不得留下内存账号。
+//
+// 与 RemoveAccount 对称：反过来会让账号在本次进程里可用、重启后消失，而调用方
+// 收到错误以为没建成——「界面显示已保存、重启后回滚」的镜像版本。
+func TestAddAccountKeepsMemoryCleanOnPersistFailure(t *testing.T) {
+	s := newTestStore(t)
+	// 关掉底层连接，让 INSERT 必然失败
+	if err := s.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	acc, err := s.AddAccount(model.ProviderZai, "ghost", "header.payload.signature")
+	if err == nil {
+		t.Fatal("落库失败应返回错误")
+	}
+	if acc != nil {
+		t.Fatal("失败时不应返回账号")
+	}
+	if s.Find(model.ProviderZai, "ghost") != nil {
+		t.Fatal("落库失败后内存不应留下账号（会与 DB 分叉）")
+	}
+}
+
+// SetSetting 落库失败时不得改动内存。
+//
+// 与 AddAccount / RemoveAccount 同一原则：反过来会让进程按未持久化的值运行，
+// 重启后回滚到旧值，而调用方收到错误以为没生效。改密钥时这尤其危险——管理员
+// 以为轮换失败、实际新值只在本次进程内有效。
+func TestSetSettingKeepsMemoryOnPersistFailure(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.SetSetting("probe_key", "original"); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := s.GetSetting("probe_key"); v != "original" {
+		t.Fatalf("前置条件: %q", v)
+	}
+
+	if err := s.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.SetSetting("probe_key", "updated"); err == nil {
+		t.Fatal("落库失败应返回错误")
+	}
+	if v, _ := s.GetSetting("probe_key"); v != "original" {
+		t.Fatalf("落库失败后内存不应改动，得到 %q", v)
+	}
+}
+
+// 读取设置不得依赖 s.mu。
+//
+// 鉴权路径（VerifyGatewayKey/VerifyAdminKey）每次请求都调 GetSetting。若它与
+// Update 共用 s.mu，一次慢写（磁盘满、外部进程持写锁，最多 busy_timeout 5s）
+// 会让所有请求的鉴权一起排队——DB 慢即全服务不可用。
+//
+// 验证方式：手动持锁，读取仍须立即返回。
+func TestGetSettingDoesNotBlockOnStoreLock(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.SetSetting("probe", "value"); err != nil {
+		t.Fatal(err)
+	}
+
+	s.mu.Lock() // 模拟一次慢写正在持锁
+	done := make(chan struct{})
+	var got string
+	var ok bool
+	go func() {
+		defer close(done)
+		got, ok = s.GetSetting("probe")
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		s.mu.Unlock()
+		t.Fatal("GetSetting 在 Store 锁被持有时阻塞了——鉴权路径会被慢写拖垮")
+	}
+	s.mu.Unlock()
+
+	if !ok || got != "value" {
+		t.Fatalf("读取结果不符: %q %v", got, ok)
+	}
+}

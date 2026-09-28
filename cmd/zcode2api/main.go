@@ -123,6 +123,71 @@ func serve() error {
 	}
 }
 
+// maxBodyBytes 请求体大小上限。
+//
+// 8 个对外入口都把 r.Body 直接交给 json.NewDecoder 解进 map[string]any，
+// 解出来的内存远大于线上字节数；网关还会为每个候选账号再序列化一次。
+// 不设上限时一个超大 JSON 就能把进程撑爆，连带杀掉所有在途 SSE 串流。
+//
+// 16 MiB 的选取：对话请求里最大的是带长上下文的多模态输入，正常远低于此；
+// 而它足以容纳任何合理请求，同时把「单个请求吃光内存」变成明确的 413。
+const maxBodyBytes = 16 << 20
+
+// limitBody 给请求体套上大小上限。
+//
+// 放在服务端而非各 handler：入口有 8 个，逐个加容易漏，且新入口默认没有
+// 防护；包在 mux 外层则新增端点自动受保护。
+func limitBody(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// securityHeaders 给响应加上浏览器侧的安全策略。
+//
+// 背景：后台金钥存在 localStorage，而 localStorage 以 origin 为界、不分路径
+// ——公开的 /guest 页与 /admin 共用同一份存储。任何能在本 origin 执行脚本的
+// 一方都能读走它，因此这里的目标是把「能执行脚本的来源」收紧到明确白名单，
+// 并禁止本站被嵌入 iframe（后台的按钮都是单击生效，iframe 点击劫持可用）。
+//
+// 只对页面响应生效：API 与 SSE 不经过浏览器渲染，加 CSP 没有意义；而这些
+// 标头对 JSON 响应也无副作用，故按路径前缀区分，避免误伤流式响应。
+func securityHeaders(next http.Handler) http.Handler {
+	// 前端实际加载的两个外部脚本：Cap widget（jsDelivr）与阿里云验证码 SDK
+	// （alicdn，后台「验证中心」页用）。两者的域名都要放行，否则对应页面失效。
+	//
+	// script-src 里的 blob: 是 Cap widget 的硬需求：它把工作量证明放进
+	// Blob URL 构造的 Web Worker 里跑，不放行则 worker 创建失败、人机验证
+	// 永远出不来题（实测确认，报错为「Creating a worker from 'blob:...'
+	// violates ... script-src」）。worker-src 单独列出以兼容只认该指令的浏览器。
+	const csp = "default-src 'self'; " +
+		"script-src 'self' 'unsafe-inline' blob: https://cdn.jsdelivr.net https://o.alicdn.com; " +
+		"worker-src 'self' blob:; " +
+		"style-src 'self' 'unsafe-inline'; " +
+		"img-src 'self' data: blob:; " +
+		"font-src 'self' data:; " +
+		// Cap 实例地址由管理员配置，可能是任意域名；widget 要直连它取题。
+		// 这里用 https: 与 http: 放行任意来源——收紧到具体域名需要把配置读进
+		// 中间件，而配置可随时变更，收益不及复杂度。
+		"connect-src 'self' https: http:; " +
+		"frame-ancestors 'none'; " +
+		"base-uri 'self'; " +
+		"form-action 'self'"
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("Content-Security-Policy", csp)
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("Referrer-Policy", "same-origin")
+		// frame-ancestors 已覆盖现代浏览器；X-Frame-Options 供旧版兜底
+		h.Set("X-Frame-Options", "DENY")
+		next.ServeHTTP(w, r)
+	})
+}
+
 // newServer 构造 HTTP 服务端。
 //
 // ReadHeaderTimeout 防 Slowloris（慢速发请求头占住连接）。
@@ -131,14 +196,18 @@ func serve() error {
 // （server.go: idleTimeout()==0 且 ReadTimeout==0 → SetReadDeadline(zero)），
 // 空闲连接永不回收，goroutine 与 fd 无界累积。
 //
+// MaxHeaderBytes 限制请求头体积：默认 1 MiB 对 Cookie/Authorization 足够，
+// 显式写小以缩小单连接可占用的内存。
+//
 // WriteTimeout 保持零值：SSE 与 async 票务的响应阶段会持续数分钟，
 // 设了会在流中途掐断（部署文档的 proxy_read_timeout 3600s 即为此配合）。
 func newServer(addr string, handler http.Handler) *http.Server {
 	return &http.Server{
 		Addr:              addr,
-		Handler:           handler,
+		Handler:           limitBody(securityHeaders(handler)),
 		ReadHeaderTimeout: 30 * time.Second,
 		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    64 << 10,
 	}
 }
 
